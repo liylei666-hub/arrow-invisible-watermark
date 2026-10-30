@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 中间产物与调试图（体积大、可随时重生成）
+arrow_wm_out/
+实测样张/
+
+# 工作副本（samples/ 下已有精选副本）
+水印样张/
+水印样张_内孔版/
+水印样张_边缘版_备份/
+
+# 历史版本与草稿
+arrow_wm_v1_backup.py
+arrow_wm_v2_edge_best.py
+user_script.py
+_ref_quad.npy
+ARROW_watermarked_pro.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.workbuddy-ai/
