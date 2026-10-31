@@ -170,6 +170,7 @@ class InnerDecoder:
         self.carrier = carrier
         self.design = carrier.design
         # 复用边缘版的配准/矫正链路（自同步 + ECC 精配 + 粗搜抢救）
+        # 真实尺寸优化（跳过高分 SIFT、粗搜两阶段、小 logo 边缘恢复）也在这条链路上。
         self._reg = A.WatermarkDecoder(self.design, use_ecc_refine=use_ecc_refine)
         if solid_reg:
             # 实测：填孔后 ECC 反而更差（17/20 -> 14/20）。内孔是锐利且分布均匀的
@@ -180,6 +181,10 @@ class InnerDecoder:
         # 之间随角度变化的系统偏差会被逐点抵消，只剩真正的调制位移。
         profs = self._profiles(self.design.template.astype(np.float32))
         self._r_ref = [self._radius(p, r0) for p, (_, _, r0) in zip(profs, self._maps)]
+        # 码元窗预计算：measure 里原先每个码元每次现场算 sin 窗，140 次重复
+        self._win = [self.carrier._window(hi, k) for hi, k in self.carrier.cells]
+        self._win_den = np.array([max(float((w * w).sum()), 1e-6) for w in self._win],
+                                 np.float32)
 
     def _use_solid_tmpl(self) -> None:
         r = self._reg
@@ -244,22 +249,28 @@ class InnerDecoder:
         """返回每个码元的径向位移投影 M（单位 px）。"""
         img = warped.astype(np.float32)
         profs = self._profiles(img)
-        feats: List[float] = []
+        feats = np.zeros(len(self.carrier.cells), np.float32)
+        # 按孔聚合位移，再一次性投影到该孔的全部码元窗
+        off = 0
         for hi, (prof, (_, _, r0)) in enumerate(zip(profs, self._maps)):
             r_meas = self._radius(prof, r0)
             delta = r_meas - self._r_ref[hi]
             # 物理上限：单侧位移不可能超过扫描半宽，越界视为测量失败
             delta = np.where(np.abs(delta) <= SCAN_HALF, delta, 0.0)
-            for k in range(self.carrier.holes[hi]["n_cells"]):
-                w = self.carrier._window(hi, k)
-                den = float((w * w).sum())
-                feats.append(float((delta * w).sum() / max(den, 1e-6)))
-        return np.array(feats, np.float32)
+            n = self.carrier.holes[hi]["n_cells"]
+            for j in range(n):
+                feats[off + j] = float(
+                    (delta * self._win[off + j]).sum() / self._win_den[off + j])
+            off += n
+        return feats
 
-    def decode(self, gray: np.ndarray) -> Dict:
+    def _decode_gray(self, gray: np.ndarray, return_debug: bool = False) -> Dict:
+        """单幅灰度图：矫正 → 内孔半径测量 → 软判决。"""
         r = self._reg.rectify(gray)
-        if not r["ok"]:
-            return {"ok": False, "reason": r.get("reason", "rectify_failed")}
+        if not r.get("ok"):
+            return {"ok": False, "reason": r.get("reason", "rectify_failed"),
+                    "digits": None, "bits": None, "mean_conf": 0.0,
+                    "margin": 0.0, "cc": 0.0}
         feat = self.measure(r["warped"])
         bits: List[int] = []
         conf: List[float] = []
@@ -271,10 +282,86 @@ class InnerDecoder:
         # 软判决最大似然：硬判决在一组内出现 2 位错时会误纠，软判决能救回
         digits, n_chg = A.decode_payload_soft(conf_a)
         hard, corrected, _ = A.decode_payload(bits)
-        return {"ok": True, "digits": digits, "digits_hard": hard, "bits": bits,
-                "feat": feat, "conf": conf_a,
-                "mean_conf": float(np.mean(np.abs(conf_a))) * 0.5,
-                "corrected": n_chg, "ecc": r["ecc"], "warped": r["warped"]}
+        ecc = dict(r.get("ecc", {}))
+        ecc.setdefault("cc", 0.0)
+        out = {"ok": True, "digits": digits, "digits_hard": hard,
+               "payload_valid": digits is not None,
+               "bits": bits, "feat": feat, "conf": conf_a,
+               "mean_conf": float(np.mean(np.abs(conf_a))) * 0.5,
+               "margin": A.codeword_margin(conf_a),
+               "corrected": n_chg, "n_corrected": n_chg,
+               "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
+               "logo_scale": float(r.get("logo_scale", 1.0)),
+               "warped": r["warped"] if return_debug else None}
+        if return_debug:
+            out["H"] = r.get("H")
+        return out
+
+    def decode(self, image: np.ndarray, return_debug: bool = False) -> Dict:
+        """内孔版解码入口：与边缘版同一套真实构图策略。
+
+          路径 A `full`     ：整幅直接解
+          路径 B `plate#k`  ：先隔离亮底卡片再解（2.2 cm 实物贴在深色产品上时）
+
+        大画幅 + 小白卡时优先走 B，避免整幅暗背景拖垮二值化/配准；
+        择优仍按 (cc≥0.85, mean_conf) 字典序，防止裁错图时 conf 虚高。
+        """
+        if image.ndim == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        CC_GATE = 0.85
+
+        def _rank(d: Dict):
+            return (1 if d.get("cc", 0.0) >= CC_GATE else 0,
+                    d.get("mean_conf", 0.0))
+
+        plates = A.WatermarkDecoder._plate_candidates(gray, k=3)
+        plate_first = False
+        if plates:
+            frac = plates[0].size / float(max(gray.size, 1))
+            plate_first = frac < 0.45 and max(gray.shape[:2]) >= 1600
+
+        best: Optional[Dict] = None
+
+        def _consider(res: Dict, path: str, isolated: bool = False) -> None:
+            nonlocal best
+            res = dict(res)
+            res["path"] = path
+            if isolated:
+                res["isolated"] = True
+            if best is None or _rank(res) > _rank(best):
+                best = res
+
+        def _good_enough(gate_cc: float, gate_conf: float) -> bool:
+            # 内孔版 mean_conf 标定与边缘不同（约 ×0.5 的差分尺度），
+            # 干净印版约 2.0+；这里用相对宽松的 0.020 作短路门限。
+            return (best is not None
+                    and best.get("cc", 0.0) >= gate_cc
+                    and best.get("mean_conf", 0.0) >= gate_conf)
+
+        if not plate_first:
+            _consider(self._decode_gray(gray, return_debug), "full")
+            if _good_enough(0.95, 0.020):
+                return best
+
+        for k, cand in enumerate(plates):
+            if cand.size / float(max(gray.size, 1)) >= 0.85:
+                continue
+            _consider(self._decode_gray(cand, return_debug), f"plate#{k}",
+                      isolated=True)
+            if _good_enough(CC_GATE, 0.020):
+                return best
+
+        if plate_first:
+            _consider(self._decode_gray(gray, return_debug), "full")
+
+        if best is not None:
+            return best
+        return {"ok": False, "reason": "decode_failed", "digits": None,
+                "bits": None, "mean_conf": 0.0, "margin": 0.0, "cc": 0.0,
+                "path": "none"}
 
 
 # ==============================================================================
@@ -348,23 +435,33 @@ def main(argv=None) -> int:
     if args.export:
         export_plates(carrier, args.export)
     if args.decode:
+        import time as _time
         dec = InnerDecoder(carrier)
-        print("=" * 70)
+        print("=" * 78)
         print("  实拍照片解码（内孔载体）")
-        print("=" * 70)
+        print("=" * 78)
         for path in args.decode:
             img = A.imread_u(path)
             if img is None:
                 print(f"  {_os.path.basename(path):<30} -> 读不到文件")
                 continue
+            t0 = _time.time()
             r = dec.decode(img)
+            dt = (_time.time() - t0) * 1000
             if r["ok"]:
+                mg = float(r.get("margin", 0.0))
+                cc = float(r.get("cc", 0.0))
+                # 内孔版无码/噪声裕度更低；门限取 0.012 与历史 conf 口径一致，
+                # 同时打印码字裕度方便与边缘版对照。
                 tag = "" if r["mean_conf"] >= 0.012 else "   [置信度低，可能未嵌入水印]"
-                print(f"  {_os.path.basename(path):<30} -> {r['digits']}   "
-                      f"置信度 {r['mean_conf']:.4f}{tag}")
+                shown = r["digits"] if r.get("payload_valid", True) else "码字越界"
+                print(f"  {_os.path.basename(path):<30} -> {shown}   "
+                      f"裕度 {mg:.2f}  cc {cc:.3f}  置信度 {r['mean_conf']:.4f}  "
+                      f"{dt:.0f}ms  path={r.get('path', '?')}{tag}")
             else:
-                print(f"  {_os.path.basename(path):<30} -> 解码失败（{r['reason']}）")
-        print("=" * 70)
+                print(f"  {_os.path.basename(path):<30} -> 解码失败（{r['reason']}）  "
+                      f"{dt:.0f}ms")
+        print("=" * 78)
     return 0
 
 

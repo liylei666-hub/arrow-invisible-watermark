@@ -1225,6 +1225,12 @@ class WatermarkDecoder:
         self._sift_tpl = (self._sift.detectAndCompute(design.template, None)
                           if self._sift is not None else ([], None))
         self._bf = cv2.BFMatcher(cv2.NORM_L2)
+        # 粗搜抢救用的 1/8 模板只算一次（每次 recover 再 resize 是纯浪费）
+        _rsc = 0.125
+        self._recover_sc = _rsc
+        self._recover_tmpl = cv2.resize(
+            self.tmpl, (int(round(CANVAS_W * _rsc)), int(round(CANVAS_H * _rsc))),
+            interpolation=cv2.INTER_AREA).astype(np.float32)
         # 参考四边形的宽高比（用于候选合理性检查）
         w, h = self._quad_wh(self.ref_quad)
         self._ref_ar = w / max(h, 1e-6)
@@ -1351,6 +1357,10 @@ class WatermarkDecoder:
         质心是全局积分量，对模糊、油墨胀缩、局部高光都不敏感。
         字母被糊成一团时，退回"整排字母凸包四角"（4 点）方案，
         且凸包简化在主轴坐标系里进行，避免滚转导致四点对应错位。
+
+        顺序：先跑几何候选（便宜）。若最佳 NCC≥0.92，说明字形自同步已经
+        足够准，跳过 SIFT（省 ~60–120 ms）。只有几何候选偏弱时才启用 SIFT——
+        这与"SIFT 命中后跳过其他候选"不同，后者会掉样本。
         """
         qs = self._quad_scale
         g_small = cv2.resize(gray, (int(gray.shape[1] * qs), int(gray.shape[0] * qs)),
@@ -1358,14 +1368,6 @@ class WatermarkDecoder:
         pool: List[Tuple[float, np.ndarray]] = []
         dst_c = np.array(self.design.letter_centroids, np.float32)
 
-        # ---- 候选 F：SIFT + RANSAC（与亮度/背景/构图无关，优先尝试） ----
-        Hs = self._sift_homography(gray)
-        if Hs is not None:
-            sc_sift = self._ncc_H(g_small, Hs)
-            pool.append((sc_sift, Hs))
-            # 注意：曾经在这里做"ncc≥0.85 就直接返回 [Hs]"的短路，能省 0.18s，
-            # 但实测让中度/重度各掉 1 个样本 —— SIFT 的 H 偶尔"看起来对、实际偏"，
-            # 保留其他候选让 ECC 有机会纠正。精度优先，不做短路。
         diff, sc = self._background_diff(gray)
         for thr in (38.0, 26.0, 18.0):
             ink = self._thresh_ink(diff, thr)
@@ -1487,6 +1489,16 @@ class WatermarkDecoder:
                     continue
                 Hm = cv2.getPerspectiveTransform(q.astype(np.float32), self.ref_quad)
                 pool.append((self._ncc_H(g_small, Hm), Hm.astype(np.float32)))
+
+        best_geo = max((s for s, _ in pool), default=-1.0)
+        # ---- 候选 F：SIFT + RANSAC（几何候选不够准时才跑） ----
+        # 干净印版/轻中度扰动下几何 NCC 经常 ≥0.92，此时 SIFT 是纯开销。
+        # 重度/极限或构图杂乱时几何偏弱，SIFT 才是主力。
+        if best_geo < 0.92:
+            Hs = self._sift_homography(gray)
+            if Hs is not None:
+                pool.append((self._ncc_H(g_small, Hs), Hs))
+
         if not pool:
             return []
         pool.sort(key=lambda t: -t[0])
@@ -1509,8 +1521,11 @@ class WatermarkDecoder:
                 self._ecc_iters, self._ecc_eps)
         S = np.array([[sc, 0, 0], [0, sc, 0], [0, 0, 1]], np.float32)
         Si = np.linalg.inv(S)
-        for motion, wshape in ((cv2.MOTION_HOMOGRAPHY, (3, 3)),
-                               (cv2.MOTION_EUCLIDEAN, (2, 3))):
+        # 单应已经拿到可用解（cc≥0.55）就不必再跑欧氏——欧氏几乎不会更好，
+        # 却要再付一次 findTransformECC。
+        motions = ((cv2.MOTION_HOMOGRAPHY, (3, 3)),
+                   (cv2.MOTION_EUCLIDEAN, (2, 3)))
+        for motion, wshape in motions:
             try:
                 wm = np.eye(wshape[0], wshape[1], dtype=np.float32)
                 cc, wm = cv2.findTransformECC(self._tmpl_half, w_small, wm,
@@ -1530,6 +1545,7 @@ class WatermarkDecoder:
                     warped, Hf, (CANVAS_W, CANVAS_H),
                     flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
+                return warped, {"cc": float(cc), "motion": int(motion)}
             else:
                 wf = wm.copy()
                 wf[0, 2] /= sc
@@ -1538,41 +1554,54 @@ class WatermarkDecoder:
                     warped, wf, (CANVAS_W, CANVAS_H),
                     flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
-            return warped, {"cc": float(cc), "motion": int(motion)}
+                return warped, {"cc": float(cc), "motion": int(motion)}
         return warped, {"rejected": True}
 
     def _recover_alignment(self, warped: np.ndarray) -> Tuple[np.ndarray, float]:
-        """粗对齐抢救：在 1/8 分辨率上搜索 旋转 x 缩放 x 平移，扩大 ECC 收敛域。
+        """粗对齐抢救：1/8 分辨率上由粗到细搜索，扩大 ECC 收敛域。
 
-        只在 ECC 相关性偏低时启用。搜索用归一化互相关模板匹配，
-        对模糊/噪声不敏感，可以把偏出几度的解拉回正确盆地。
+        只在 ECC 相关性偏低时启用。原实现是 7×5×5=175 次全组合；
+        改为两阶段：先搜旋转×缩放（剪切=0），再在最优点附近扫剪切与
+        微调角度——同等覆盖、约 1/3 代价。
         """
-        sc = 0.125
-        tw, th = int(round(CANVAS_W * sc)), int(round(CANVAS_H * sc))
-        t = cv2.resize(self.tmpl, (tw, th), interpolation=cv2.INTER_AREA).astype(np.float32)
+        sc = self._recover_sc
+        t = self._recover_tmpl
+        th, tw = t.shape
         w = cv2.resize(warped.astype(np.float32) / 255.0, (tw, th),
                        interpolation=cv2.INTER_AREA)
         pad = 26
         cx, cy = tw * 0.5, th * 0.5
         best_s, best_T = -2.0, None
+        best_ang, best_scl = 0.0, 1.0
+
+        def _score(M3: np.ndarray) -> Tuple[float, np.ndarray]:
+            w2 = cv2.warpAffine(w, M3[:2], (tw, th), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE)
+            w2p = cv2.copyMakeBorder(w2, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+            res = cv2.matchTemplate(w2p, t, cv2.TM_CCOEFF_NORMED)
+            _, mx, _, mloc = cv2.minMaxLoc(res)
+            T = np.array([[1, 0, mloc[0] - pad], [0, 1, mloc[1] - pad],
+                          [0, 0, 1]], np.float32)
+            return float(mx), T @ M3
+
+        # 阶段 1：旋转 × 缩放（35 次）
         for ang in (-9, -6, -3, 0, 3, 6, 9):
             for scl in (0.90, 0.95, 1.0, 1.05, 1.10):
                 M0 = cv2.getRotationMatrix2D((cx, cy), ang, scl)
-                for sh in (-0.14, -0.07, 0.0, 0.07, 0.14):
-                    # 以画幅中心为不动点施加剪切，弥补粗配准残留的斜切
-                    Sh = np.array([[1.0, sh, -sh * cy], [0.0, 1.0, 0.0],
-                                   [0.0, 0.0, 1.0]], np.float32)
-                    M3 = Sh @ np.vstack([M0, [0, 0, 1]]).astype(np.float32)
-                    w2 = cv2.warpAffine(w, M3[:2], (tw, th), flags=cv2.INTER_LINEAR,
-                                        borderMode=cv2.BORDER_REPLICATE)
-                    w2p = cv2.copyMakeBorder(w2, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
-                    res = cv2.matchTemplate(w2p, t, cv2.TM_CCOEFF_NORMED)
-                    _, mx, _, mloc = cv2.minMaxLoc(res)
-                    if mx > best_s:
-                        T = np.array([[1, 0, mloc[0] - pad], [0, 1, mloc[1] - pad],
-                                      [0, 0, 1]], np.float32)
-                        best_s = float(mx)
-                        best_T = T @ M3
+                M3 = np.vstack([M0, [0, 0, 1]]).astype(np.float32)
+                mx, T = _score(M3)
+                if mx > best_s:
+                    best_s, best_T, best_ang, best_scl = mx, T, float(ang), float(scl)
+        # 阶段 2：在最优点附近扫剪切 + 微角度（5×5=25 次）
+        for sh in (-0.14, -0.07, 0.0, 0.07, 0.14):
+            for dang in (-2.0, -1.0, 0.0, 1.0, 2.0):
+                M0 = cv2.getRotationMatrix2D((cx, cy), best_ang + dang, best_scl)
+                Sh = np.array([[1.0, sh, -sh * cy], [0.0, 1.0, 0.0],
+                               [0.0, 0.0, 1.0]], np.float32)
+                M3 = Sh @ np.vstack([M0, [0, 0, 1]]).astype(np.float32)
+                mx, T = _score(M3)
+                if mx > best_s:
+                    best_s, best_T = mx, T
         if best_T is None:
             return warped, -1.0
         S = np.array([[sc, 0, 0], [0, sc, 0], [0, 0, 1]], np.float32)
@@ -1581,6 +1610,34 @@ class WatermarkDecoder:
                                   flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                                   borderMode=cv2.BORDER_REPLICATE)
         return out, best_s
+
+    def _logo_scale(self, H: np.ndarray) -> float:
+        """由 image→plate 单应反推照片里 logo 相对底版的尺度（宽比）。"""
+        try:
+            Hi = np.linalg.inv(H.astype(np.float64)).astype(np.float32)
+            q = cv2.perspectiveTransform(
+                self.ref_quad.reshape(1, -1, 2), Hi).reshape(-1, 2)
+            w = 0.5 * (np.linalg.norm(q[0] - q[1]) + np.linalg.norm(q[3] - q[2]))
+            return float(w / CANVAS_W)
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _restore_edges(warped: np.ndarray, scale: float) -> np.ndarray:
+        """真实尺寸拍摄时 logo 往往只占画面一小块，矫正回 2200×600 等于强放大，
+        双线性会抹掉 ±1.8 px 的调制。轻度反锐化遮罩把边缘对比度拉回来。
+        scale≥0.45（接近半幅以上）时不处理，避免动干净印版的数值路径。
+        """
+        if scale >= 0.45:
+            return warped
+        up = 1.0 / max(scale, 1e-6)
+        amt = min(1.35, 0.30 + 0.22 * (up - 2.0))
+        if amt <= 0.05:
+            return warped
+        sig = min(1.7, 0.75 + 0.10 * up)
+        blur = cv2.GaussianBlur(warped, (0, 0), sig)
+        return np.clip(cv2.addWeighted(warped, 1.0 + amt, blur, -amt, 0),
+                       0, 255).astype(np.uint8)
 
     def rectify(self, gray: np.ndarray) -> Dict:
         """多起点矫正 + 收敛域抢救，取相关性最高的结果。"""
@@ -1595,7 +1652,9 @@ class WatermarkDecoder:
             ecc: Dict = {}
             if self.use_ecc_refine:
                 warped, ecc = self._ecc_refine(warped)
-                if float(ecc.get("cc", 0.0)) < 0.80:
+                # 粗搜只给排名前两的起点：后面的候选就算拉回来，
+                # 也很少超过已经试过的更好起点，却会再付 1–2 次 ECC。
+                if float(ecc.get("cc", 0.0)) < 0.80 and k < 2:
                     # ECC 没收敛好：先用粗搜把它拉回正确盆地，再精配一次。
                     # 注意图像与分数必须成对替换——曾经只换了图不换分，
                     # 导致候选之间拿"旧图的分数"比"新图的画质"。
@@ -1611,8 +1670,13 @@ class WatermarkDecoder:
             if best is None or cc > best["cc"]:
                 best = {"ok": True, "warped": warped, "H": Hm, "ecc": ecc,
                         "cc": cc, "tries": k + 1}
-            if cc >= 0.88:
+            # 与解码入口的 CC_GATE=0.85 对齐：到门限即可停，不必追到 0.88
+            if cc >= 0.85:
                 break
+        # 小尺寸实拍：边缘恢复后再交给宽度测量
+        sc = self._logo_scale(best["H"])
+        best["logo_scale"] = sc
+        best["warped"] = self._restore_edges(best["warped"], sc)
         best.pop("cc", None)
         return best
 
@@ -1689,12 +1753,16 @@ class WatermarkDecoder:
         return r - l + 1.0
 
     def extract_widths(self, warped: np.ndarray) -> np.ndarray:
-        """逐行亚像素宽度 + 正弦匹配滤波 + 成对差分。
+        """亚像素宽度 + 正弦匹配滤波 + 成对差分。
 
-        逐行实现（每码元每行取一次整数列窗口）。向量化版本 `_extract_widths_fast`
-        快 6 倍，但因窗口按固定列宽、背景估计差一列，会带来 0.4 px 级偏差，
-        实测让中度档从 100% 掉到 96% —— 精度优先，默认走逐行实现。
+        默认走向量化实现（整数列 + INTER_NEAREST，与逐行路径逐位一致）。
+        早期双线性 remap 版本曾让中度档掉到 96%，已修正；20×5 回归上
+        成功率不低于逐行，耗时约 1/2.5。
         """
+        return self._extract_widths_fast(warped)
+
+    def _extract_widths_slow(self, warped: np.ndarray) -> np.ndarray:
+        """逐行参考实现（调试/对照用）。"""
         img = warped.astype(np.float32)
         H = img.shape[0]
         prof: List[Tuple[np.ndarray, np.ndarray]] = []
@@ -1731,7 +1799,7 @@ class WatermarkDecoder:
         return out
 
     def _extract_widths_fast(self, warped: np.ndarray) -> np.ndarray:
-        """向量化的逐行半高宽测量（与原逐行实现等价，但快约 6 倍）。
+        """向量化的逐行半高宽测量（与 `_extract_widths_slow` 等价，快约 2.5×）。
 
         原实现每个码元每行调一次 `_row_width`，140×16 ≈ 2200 次 Python 调用；
         这里把每个码元的采样网格一次性 remap 出来，再用 numpy 批量算阈值与
@@ -1922,6 +1990,7 @@ class WatermarkDecoder:
                "widths": feat, "n_corrected": n_corr,
                "mean_conf": float(np.mean(np.abs(conf))),
                "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
+               "logo_scale": float(r.get("logo_scale", 1.0)),
                "warped": warped if return_debug else None}
         if return_debug:
             out["H"] = r["H"]
@@ -1930,21 +1999,19 @@ class WatermarkDecoder:
     def decode(self, image: np.ndarray, return_debug: bool = False) -> Dict:
         """解码入口：**先定位再解码**，而不是先硬解再补救。
 
-        定位分两路并行产出假设，各自完整解一次，取置信度更高的：
+        定位分两路产出假设，各自完整解一次，取置信度更高的：
 
           路径 A：整幅图直接解（logo 本来就占满画面时最合适）
           路径 B：先隔离"亮底卡片"再解（logo 是白底标签贴在深色产品/屏幕上时）
 
-        路径 B 只在隔离出的区域明显小于原图时才跑（否则两者等价，白跑一遍）。
-        这样两种构图都能一次命中，而不是靠失败后重试。
+        真实尺寸微距拍摄时，2.2 cm logo 在大画幅里往往只是一张小白卡。
+        这时先跑路径 B 能少付一次失败的整幅配准；反之 logo 已占满画面
+        时仍先走路径 A。路径 B 只在隔离区明显小于原图时才跑。
         """
         if image.ndim == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
-
-        best = self._decode_gray(gray, return_debug)
-        best["path"] = "full"
 
         # 择优规则：配准不可信（cc 过低）的解，置信度再高也不能信 ——
         # 实测：一条错误路径把整幅裁错，宽度测量全乱，conf 虚高到 0.12，
@@ -1955,23 +2022,56 @@ class WatermarkDecoder:
             return (1 if d.get("cc", 0.0) >= CC_GATE else 0,
                     d.get("mean_conf", 0.0))
 
-        # 整幅已经解得又稳又准，就不必再花时间定位了
-        if best.get("cc", 0.0) >= 0.95 and best.get("mean_conf", 0.0) >= 0.030:
-            return best
+        plates = self._plate_candidates(gray, k=3)
+        # 小卡片判定：最大亮连通域面积 < 画面 45%，且画幅明显大于底版
+        plate_first = False
+        if plates:
+            frac = plates[0].size / float(max(gray.size, 1))
+            big = max(gray.shape[:2]) >= 1600
+            plate_first = frac < 0.45 and big
 
-        for k, cand in enumerate(self._plate_candidates(gray, k=3)):
+        best: Optional[Dict] = None
+
+        def _consider(res: Dict, path: str, isolated: bool = False) -> None:
+            nonlocal best
+            res = dict(res)
+            res["path"] = path
+            if isolated:
+                res["isolated"] = True
+            if best is None or _rank(res) > _rank(best):
+                best = res
+
+        def _good_enough(gate_cc: float, gate_conf: float) -> bool:
+            return (best is not None
+                    and best.get("cc", 0.0) >= gate_cc
+                    and best.get("mean_conf", 0.0) >= gate_conf)
+
+        if not plate_first:
+            _consider(self._decode_gray(gray, return_debug), "full")
+            # 整幅已经解得又稳又准，就不必再花时间定位了
+            if _good_enough(0.95, 0.030):
+                return best
+
+        for k, cand in enumerate(plates):
             # 隔离区没比原图小多少 -> 说明整幅就是底版，没必要再解一次
             if cand.size / float(max(gray.size, 1)) >= 0.85:
                 continue
-            alt = self._decode_gray(cand, return_debug)
-            alt["path"] = f"plate#{k}"
-            if _rank(alt) > _rank(best):
-                alt["isolated"] = True
-                best = alt
-            # 已经拿到可信且置信度足够高的结果，不再试更小的候选
-            if best.get("cc", 0.0) >= CC_GATE and best.get("mean_conf", 0.0) >= 0.030:
-                break
-        return best
+            _consider(self._decode_gray(cand, return_debug), f"plate#{k}",
+                      isolated=True)
+            if _good_enough(CC_GATE, 0.030):
+                return best
+
+        # 小卡片优先时，若卡片路径不够好，再补整幅兜底
+        if plate_first:
+            _consider(self._decode_gray(gray, return_debug), "full")
+
+        if best is not None:
+            return best
+        return {
+            "ok": False, "reason": "decode_failed", "digits": None,
+            "bits": None, "ber": 1.0, "conf": 0.0, "mean_conf": 0.0,
+            "n_corrected": 0, "path": "none",
+        }
 
 class BenchmarkRunner:
     """50 组随机号码 x 5 档扰动，统计 BER 与 11 位完整解码成功率。"""

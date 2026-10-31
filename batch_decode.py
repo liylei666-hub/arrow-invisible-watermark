@@ -67,7 +67,9 @@ def main(argv=None) -> int:
     else:
         import arrow_inner as I
         dec = I.InnerDecoder(I.InnerCarrier(design))
-        default_thr = 0.012
+        # 内孔版现已返回码字裕度（与边缘版同一口径）。
+        # 实测：真码 ≥3.3（含 0.13× 小图），无码 ≈0.4，噪声 ≤1.2；门限取 1.8。
+        default_thr = 1.8
     thr = args.thresh if args.thresh is not None else default_thr
 
     print(f"载体 {args.carrier}   共 {len(files)} 张   裕度门限 {thr:g}")
