@@ -2485,6 +2485,24 @@ def run_demo(embedder: WatermarkEmbedder, sim: CeramicCamSimulator,
     return {"digits": digits, "samples": samples, "self_ber": ber0}
 
 
+def _print_decode_line(name: str, res, dt: float) -> None:
+    """Print one production decode. Rejected rows never lead with a phone number."""
+    import arrow_decode as AD
+    scale = f"{res.logo_scale:.2f}" if res.logo_scale is not None else "—"
+    tail = (f"裕度 {res.margin:.2f}  cc {res.cc:.3f}  "
+            f"scale {scale}  置信度 {res.mean_conf:.4f}   {dt * 1000:.0f} ms")
+    if res.accepted:
+        print(f"  {name:<32} -> {res.digits}   {tail}  接受")
+        return
+    if res.candidate_digits:
+        extra = f"候选 {res.candidate_digits}（不可信）"
+    elif res.ok:
+        extra = "候选 码字越界（不可信）"
+    else:
+        extra = "无候选"
+    print(f"  {name:<32} -> 拒绝（{AD.reason_text(res.reason)}）  {extra}   {tail}")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="ARROW 陶瓷 Logo 隐形水印：嵌入 / 物理信道模拟 / 盲解码")
@@ -2504,10 +2522,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     do_bench = args.bench or args.all or (not args.demo and not args.bench)
 
     if args.decode:
-        design = ArrowDesign()
-        decoder = WatermarkDecoder(design, use_ecc_refine=not args.no_ecc)
+        # 生产门限走 arrow_decode。--no-ecc 时研究解码器不计算 cc，
+        # 因此只保留裕度门，cc 门关掉；默认路径两个门都开。
+        # 压测仍直接调用 WatermarkDecoder.decode，不经过这道门。
+        import arrow_decode as AD
+        session = AD.Decoder(
+            carrier="edge",
+            cc_threshold=None if args.no_ecc else AD.CC_THRESHOLD,
+            use_ecc_refine=not args.no_ecc)
         print("=" * 74)
-        print("  实拍照片解码")
+        if args.no_ecc:
+            cc_note = "cc 门关闭（--no-ecc 不计算配准分）"
+        else:
+            cc_note = f"cc ≥ {AD.CC_THRESHOLD:g}"
+        print(f"  实拍照片解码（边缘载体）  裕度 ≥ {AD.MARGIN_THRESHOLD:g}  {cc_note}")
         print("=" * 74)
         for path in args.decode:
             img = imread_u(path)
@@ -2515,23 +2543,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"  {path}  ->  读不到文件")
                 continue
             t0 = time.time()
-            res = decoder.decode(img)
+            res = session.decode(img)
             dt = time.time() - t0
-            if res["ok"]:
-                conf = res["mean_conf"]
-                mg = res.get("margin", 0.0)
-                # 判据用码字裕度（真码 ≥2.0，噪声/无码 ≤1.4），比 mean|conf| 可靠
-                tag = "" if mg >= 1.8 else "   [码字裕度不足，可能未嵌入水印]"
-                if res.get("payload_valid", True):
-                    shown = res["digits"]
-                else:
-                    # 37 bit 解出 1e11 以上的值：这段码字不对应任何合法号码
-                    shown = "码字越界（非有效号码）"
-                    tag = "   [该码字不合法]"
-                print(f"  {os.path.basename(path):<32} -> {shown}   "
-                      f"裕度 {mg:.2f}  置信度 {conf:.4f}   {dt * 1000:.0f} ms{tag}")
-            else:
-                print(f"  {os.path.basename(path):<32} -> 解码失败（{res['reason']}）")
+            _print_decode_line(os.path.basename(path), res, dt)
         print("=" * 74)
         return 0
 
