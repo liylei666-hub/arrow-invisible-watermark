@@ -70,7 +70,8 @@ _MS_SEGMENT = re.compile(r"^ms-[A-Za-z0-9_-]+$")
 # RLock so decode_image can call get_decoder while already holding the lock.
 # The lock stays held for the whole decode: OpenCV's matcher is not re-entrant.
 _lock = threading.RLock()
-_sessions: dict[str, AD.Decoder] = {}
+# Edge sessions are keyed by layout version. Inner ignores layout.
+_sessions: dict[tuple, AD.Decoder] = {}
 
 
 def strip_ms_prefix(path: str) -> str:
@@ -123,22 +124,49 @@ def _warmup_carriers() -> list[str]:
     return [AD.DEFAULT_CARRIER, "inner"]
 
 
-def get_decoder(carrier: str) -> AD.Decoder:
-    """Return the cached session for ``carrier``, building it on first use."""
+def normalize_layout(raw: Optional[str]) -> str:
+    """Edge layout selector. Blank means v2. ``auto`` tries v2, then v1."""
+    text = "2" if raw is None or str(raw).strip() == "" else str(raw).strip().lower()
+    if text not in ("1", "2", "auto"):
+        raise HTTPException(
+            status_code=400, detail="layout must be 1, 2, or auto")
+    return text
+
+
+def get_decoder(carrier: str, layout: str = "2") -> AD.Decoder:
+    """Return the cached session for ``carrier``, building it on first use.
+
+    ``layout`` is the edge layout version (``"1"`` or ``"2"``). Inner ignores it.
+    """
     if carrier not in AD.CARRIERS:
         raise ValueError(f"carrier must be one of {AD.CARRIERS}, got {carrier!r}")
+    version = int(layout) if carrier == "edge" else None
+    key = (carrier, version)
     with _lock:
-        session = _sessions.get(carrier)
+        session = _sessions.get(key)
         if session is None:
-            session = AD.Decoder(carrier=carrier)
-            _sessions[carrier] = session
+            session = AD.Decoder(carrier=carrier, layout_version=version)
+            _sessions[key] = session
         return session
 
 
-def decode_image(carrier: str, gray: np.ndarray) -> AD.DecodeResult:
-    """Run one production decode under the process-wide lock."""
+def decode_image(carrier: str, gray: np.ndarray, layout: str = "2") -> AD.DecodeResult:
+    """Run one production decode under the process-wide lock.
+
+    ``layout="auto"`` on the edge carrier tries v2, then the frozen v1 plate
+    (depth 1.8). The first accept wins; otherwise the higher-margin reject.
+    """
     with _lock:
-        return get_decoder(carrier).decode(gray)
+        if carrier == "edge" and layout == "auto":
+            first = get_decoder(carrier, "2").decode(gray)
+            if first.accepted:
+                return first
+            second = get_decoder(carrier, "1").decode(gray)
+            if second.accepted or second.margin > first.margin:
+                return second
+            return first
+        used = layout if carrier == "edge" else "2"
+        return get_decoder(carrier, used).decode(gray)
 
 
 def candidate_debug_allowed(debug: bool) -> bool:
@@ -271,14 +299,15 @@ def declared_length(request: Request) -> Optional[int]:
 
 
 async def finish_decode(carrier: str, data: bytes, *,
-                        include_candidate: bool = False):
+                        include_candidate: bool = False,
+                        layout: str = "2"):
     """Shared tail for every ``POST /decode`` body shape."""
     if not data:
         raise HTTPException(status_code=400, detail="empty image")
     ensure_upload_size(len(data))
     gray = bytes_to_gray(data)
     try:
-        result = await run_in_threadpool(decode_image, carrier, gray)
+        result = await run_in_threadpool(decode_image, carrier, gray, layout)
     except HTTPException:
         raise
     except Exception:
@@ -289,7 +318,8 @@ async def finish_decode(carrier: str, data: bytes, *,
 
 
 async def decode_json_body(request: Request, query_carrier: Optional[str], *,
-                           include_candidate: bool = False):
+                           include_candidate: bool = False,
+                           query_layout: Optional[str] = None):
     """``{"image_base64": "...", "carrier": "edge"}``. Query carrier wins."""
     length = declared_length(request)
     if length is not None and length > _BASE64_CHAR_CAP + 4096:
@@ -305,17 +335,24 @@ async def decode_json_body(request: Request, query_carrier: Optional[str], *,
         if payload.get("carrier") is not None:
             raw_carrier = payload.get("carrier")
     chosen = carrier_from_value(None if raw_carrier is None else str(raw_carrier))
+    raw_layout = query_layout
+    if raw_layout is None or str(raw_layout).strip() == "":
+        if payload.get("layout") is not None:
+            raw_layout = payload.get("layout")
+    layout = normalize_layout(None if raw_layout is None else str(raw_layout))
     image = payload.get("image_base64")
     if not isinstance(image, str):
         image = payload.get("image")
     if not isinstance(image, str) or not image.strip():
         raise HTTPException(status_code=400, detail="missing image_base64")
     return await finish_decode(
-        chosen, decode_base64_image(image), include_candidate=include_candidate)
+        chosen, decode_base64_image(image), include_candidate=include_candidate,
+        layout=layout)
 
 
 async def decode_raw_body(request: Request, query_carrier: Optional[str], *,
-                          include_candidate: bool = False):
+                          include_candidate: bool = False,
+                          query_layout: Optional[str] = None):
     """Raw image bytes. ``carrier`` is the query param (default ``edge``)."""
     length = declared_length(request)
     if length is not None and length > MAX_IMAGE_BYTES:
@@ -323,7 +360,8 @@ async def decode_raw_body(request: Request, query_carrier: Optional[str], *,
     data = await request.body()
     return await finish_decode(
         carrier_from_value(query_carrier), data,
-        include_candidate=include_candidate)
+        include_candidate=include_candidate,
+        layout=normalize_layout(query_layout))
 
 
 def select_upload(form) -> Optional[UploadFile]:
@@ -372,6 +410,7 @@ def health():
 async def decode_endpoint(
     request: Request,
     carrier: Optional[str] = Query(default=None),
+    layout: Optional[str] = Query(default=None),
     debug: bool = Query(default=False),
     x_decode_token: Optional[str] = Header(default=None, alias="X-Decode-Token"),
 ):
@@ -380,10 +419,12 @@ async def decode_endpoint(
     kind = media_type(request.headers.get("content-type", ""))
     if kind == "application/json":
         return await decode_json_body(
-            request, carrier, include_candidate=include_candidate)
+            request, carrier, include_candidate=include_candidate,
+            query_layout=layout)
     if kind in _RAW_MEDIA_TYPES:
         return await decode_raw_body(
-            request, carrier, include_candidate=include_candidate)
+            request, carrier, include_candidate=include_candidate,
+            query_layout=layout)
     if kind != "multipart/form-data":
         raise HTTPException(status_code=400, detail="expected multipart/form-data")
     try:
@@ -392,6 +433,12 @@ async def decode_endpoint(
         raise HTTPException(status_code=400, detail="expected multipart/form-data")
     try:
         chosen = pick_carrier(carrier, form)
+        form_layout = layout
+        if form_layout is None or str(form_layout).strip() == "":
+            item = form.get("layout")
+            if item is not None and not isinstance(item, UploadFile):
+                form_layout = str(item)
+        chosen_layout = normalize_layout(form_layout)
         upload = select_upload(form)
         if upload is None:
             raise HTTPException(
@@ -402,4 +449,5 @@ async def decode_endpoint(
     finally:
         await form.close()
     return await finish_decode(
-        chosen, data, include_candidate=include_candidate)
+        chosen, data, include_candidate=include_candidate,
+        layout=chosen_layout)

@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import hashlib
 import itertools
 import json
 import math
@@ -102,11 +104,37 @@ WINDOW_POW: float = 1.0       # 调制窗形状：1 = sin(πt)（斜率不连续
 MOD_DEPTH: float = 6.0        # 单侧边沿峰值偏移（px @ 底版尺度，约 0.060 mm）
 # 与内孔载体 DEPTH 对齐。±0.060 mm 在 2.2 cm 的 logo 上仍低于约 0.1 mm 的
 # 视距分辨；打印 1200 dpi 时约 2.8 个墨点。早期 1.8 px 的已发表压测数字
-# 是旧工作点，不是当前默认。
+# 是布局 v1 的工作点，不是当前默认。
 CELL_MARGIN: int = 10         # 解码测量窗相对笔画边缘的余量
-# 测量窗伸出笔画边缘 d+CELL_MARGIN，两侧同时调制时净空还要再让出 d。
-# 约束：净空 ≥ 2*MOD_DEPTH + CELL_MARGIN。6 px 时为 22。
-MIN_CLEARANCE: int = 22       # Cell 与邻近笔画的最小净空（保证测量窗不串扰）
+# 测量窗伸出笔画边缘 d+CELL_MARGIN，对向调制再让出一个 d，并留 2px。
+# d=6 时 max(20, ceil(2*6+10+2)) = 24。v1 印版不走这条，锁 min_clear=20。
+
+
+def min_clearance_for_depth(d: float) -> int:
+    """v2 净空下限，随调制深度推导。"""
+    return max(20, int(math.ceil(2.0 * float(d) + CELL_MARGIN + 2)))
+
+
+def min_stroke_w_for_depth(d: float) -> float:
+    """v2 笔画宽度下限 = 4*d。d=6 时为 24px。"""
+    return 4.0 * float(d)
+
+
+def end_trim_for_depth(d: float) -> int:
+    """v2 区段两端裁掉的行数 = ceil(d)。"""
+    return int(math.ceil(float(d)))
+
+
+MIN_CLEARANCE: int = min_clearance_for_depth(MOD_DEPTH)  # 24 @ d=6
+MIN_CELL_H: int = 14
+LAYOUT_VERSION: int = 2
+V1_DEPTH: float = 1.8
+V1_MIN_CLEARANCE: int = 20
+PAIR_PERM_ID_V1: str = "v1-identity"
+PAIR_PERM_ID_V2: str = "v2-snake-r1"
+# 路径择优用的归一化软值门。depth=1.8 时 mean|conf|≈0.030 约是满调制的 0.75。
+# 这里改看 soft_n，避免 6px 下沿用 1.8 时期的绝对 conf 门。
+SOFT_N_PATH_GATE: float = 0.70
 
 PAYLOAD_DIGITS: int = 11
 PAYLOAD_BITS: int = 37        # 10^11 - 1 < 2^37
@@ -369,9 +397,23 @@ def pad_bits_from_hard(bits: Sequence[int]) -> Optional[Tuple[int, int, int]]:
     return (int(data[0]), int(data[1]), int(data[2]))
 
 
+def expected_differential_px(depth: float) -> float:
+    """满调制时一对码元的匹配滤波差分（px）。
+
+    单侧边沿峰值是 depth，笔画两侧一起动，宽度峰值约 2·depth。
+    窗是 sin，投影按 Σs 归一（不是 Σs²），单格输出约 (π/2)·depth，
+    对向的另一格再减一次，差分约 π·depth。soft_n = 实测差分 / 这个期望。
+    """
+    return math.pi * float(depth)
+
+
 def readout_qc(conf: Sequence[float], bits: Sequence[int], *,
                soft: bool) -> Dict:
-    """生产门要用的裕度与补零。``margin`` 仍是各组间隙的平均。"""
+    """生产门要用的裕度与补零。``margin`` 仍是各组间隙的平均。
+
+    ``conf`` 在边缘路径上应是按期望幅度归一化后的 soft_n，不是像素差分。
+    间隙再除以 soft 的标准差，所以它不是 px 门限。
+    """
     ms = group_codeword_margins(conf)
     mean = float(ms.mean()) if ms.size else 0.0
     minimum = float(ms.min()) if ms.size else 0.0
@@ -640,7 +682,14 @@ class Cell:
     slope: float
     width: float
     half_win: int
-    clearance: float = 0.0   # 该段与邻笔的最小净空（px）；0 表示旧布局没记录
+    clearance: float = 0.0   # 该段与邻笔的最小净空（px）
+    letter: str = ""
+    letter_i: int = -1
+    interval: int = -1
+    iv_y0: int = 0
+    iv_y1: int = 0
+    depth_scale: float = 1.0
+    pair_risk: float = 0.0
 
     def center_at(self, y: float) -> float:
         return self.x_mid + self.slope * (y - self.y_mid)
@@ -648,6 +697,11 @@ class Cell:
     @property
     def height(self) -> int:
         return self.y1 - self.y0
+
+    def dist_to_iv_end(self) -> float:
+        if self.iv_y1 <= self.iv_y0:
+            return 0.0
+        return float(min(self.y0 - self.iv_y0, self.iv_y1 - self.y1))
 
 
 class ArrowDesign:
@@ -658,8 +712,17 @@ class ArrowDesign:
     这 4 点与设计稿一一对应，构成 findHomography 的基准。
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, depth: float = MOD_DEPTH,
+                 layout_version: int = LAYOUT_VERSION,
+                 window_pow: float = WINDOW_POW):
         self.verbose = verbose
+        self.layout_version = int(layout_version)
+        if self.layout_version not in (1, 2):
+            raise ValueError(f"layout_version 只能是 1 或 2，收到 {layout_version}")
+        # v1 的码元位置锁在 min_clear=20 的旧算法上。depth 仍可取 6，
+        # 只影响调制幅度和测量窗，不挪码元。这是消融里的 v1@6。
+        self.depth = float(depth)
+        self.window_pow = float(window_pow)
         self.text_mask4 = self._rasterize()
         self.mask4 = self.text_mask4          # 无锚点：掩膜即纯文字
         self.anchor_mask4 = np.zeros_like(self.text_mask4)
@@ -676,6 +739,8 @@ class ArrowDesign:
         self.mom_mu = _p.mean(axis=0)
         self.mom_C = np.cov((_p - self.mom_mu).T)
         self.cells: List[Cell] = []
+        self.pair_perm: Tuple[int, ...] = tuple(range(N_BITS))
+        self.pair_perm_id: str = PAIR_PERM_ID_V1
         self._build_cells()
 
     # ---------------- 栅格化 ----------------
@@ -776,12 +841,55 @@ class ArrowDesign:
 
     # ---------------- 码元布局 ----------------
     def _build_cells(self) -> None:
-        self.cells = build_layout(self.mask1, n_cells=N_CELLS, d=MOD_DEPTH,
-                                  margin=CELL_MARGIN, min_clear=MIN_CLEARANCE)
+        self.cells = build_layout(self.mask1, n_cells=N_CELLS, d=self.depth,
+                                  margin=CELL_MARGIN, version=self.layout_version)
+        self._annotate_letters()
+        if self.layout_version == 1:
+            self.pair_perm = tuple(range(N_BITS))
+            self.pair_perm_id = PAIR_PERM_ID_V1
+        else:
+            derived = derive_pair_perm(self.cells)
+            # 默认 v2@6 的置换是冻结常量。其它深度仍用同一规则现算，
+            # 保证编码器和解码器对得上，同时默认印版不随实现漂移。
+            if abs(self.depth - MOD_DEPTH) < 1e-9:
+                if derived != PAIR_PERM_V2:
+                    raise RuntimeError(
+                        "v2@6 的 PAIR_PERM 与冻结常量不一致。"
+                        "布局改了就要有意识地更新 PAIR_PERM_V2。")
+                self.pair_perm = PAIR_PERM_V2
+            else:
+                self.pair_perm = derived
+            self.pair_perm_id = PAIR_PERM_ID_V2
         if self.verbose:
-            print(f"[Design] 码元数 = {len(self.cells)}，"
+            print(f"[Design] layout=v{self.layout_version} depth={self.depth:g} "
+                  f"码元数 = {len(self.cells)}，"
                   f"平均高度 = {np.mean([c.height for c in self.cells]):.1f}px，"
-                  f"平均笔画宽 = {np.mean([c.width for c in self.cells]):.1f}px")
+                  f"平均笔画宽 = {np.mean([c.width for c in self.cells]):.1f}px "
+                  f"perm={self.pair_perm_id}")
+
+    def _annotate_letters(self) -> None:
+        """按五个字母的水平跨度给码元打字母。两个 R 记成 R1 / R2。"""
+        names = ("A", "R1", "R2", "O", "W")
+        spans: List[Tuple[str, int, float, float]] = []
+        for i, ((name, x_off), (_, w)) in enumerate(
+                zip(self._place_letters(), _glyph_sequence())):
+            label = names[i] if i < len(names) else name
+            spans.append((label, i, float(x_off), float(x_off + w * CAP_H)))
+        for c in self.cells:
+            hit = None
+            best = None
+            best_d = 1e18
+            for label, idx, x0, x1 in spans:
+                if x0 <= c.x_mid <= x1:
+                    hit = (label, idx)
+                    break
+                dist = min(abs(c.x_mid - x0), abs(c.x_mid - x1))
+                if dist < best_d:
+                    best_d = dist
+                    best = (label, idx)
+            label, idx = hit if hit is not None else best
+            c.letter = label
+            c.letter_i = idx
 
     def render(self, mask4: np.ndarray) -> np.ndarray:
         """把 4x 二值掩膜渲染成 8bit 灰度底版（白底深灰字）。"""
@@ -794,89 +902,38 @@ class ArrowDesign:
         """未加水印的原始底版（解码器用作配准模板）。"""
         return self.render(self.mask4)
 
-
-def _segment_stability(seg: Sequence[Tuple]) -> Tuple[float, float, float]:
-    """净空、|斜率|、纵向中点。净空和斜率来自布局阶段，不看具体号码。"""
-    ys = np.array([p[0] for p in seg], float)
-    cs = np.array([p[1] for p in seg], float)
-    slope = float(np.polyfit(ys, cs, 1)[0]) if len(ys) >= 2 else 0.0
-    clearance = float(min(p[3] for p in seg)) if seg and len(seg[0]) >= 4 else 0.0
-    return clearance, abs(slope), float(ys.mean()) if len(ys) else 0.0
-
-
-def _pair_fragility(seg_a: Sequence[Tuple], seg_b: Sequence[Tuple]) -> float:
-    """差分对有多容易错。数字来自 MOD_DEPTH=6 的小样本误码统计，见 README。
-
-    4 个号码 × moderate/heavy/extreme（12 次解码，840 bit）：
-      净空卡在 22px 门限上的位 BER 3.33%，净空 ≥30 的位约 1.7%；
-      |斜率| ≥ 0.6 的位 BER 5.0%，|斜率| < 0.2 的位 0.46%；
-      字高上沿 y∈[100,200) 的位 BER 4.2%，中下段约 1.6–1.8%。
-    有多余码元时优先丢掉这三类，而不是按轨迹顺序砍掉末尾。
-    """
-    cl_a, sl_a, y_a = _segment_stability(seg_a)
-    cl_b, sl_b, y_b = _segment_stability(seg_b)
-    clearance = min(cl_a, cl_b)
-    slope = max(sl_a, sl_b)
-    y_mid = 0.5 * (y_a + y_b)
-    cost = 0.0
-    if clearance < 30.0:
-        cost += 30.0 - clearance
-    if slope >= 0.45:
-        cost += (slope - 0.45) * 40.0
-    if y_mid < 200.0:
-        cost += (200.0 - y_mid) * 0.05
-    return cost
+def layout_geometry_token(cells: Sequence[Cell], *, with_window: bool = True) -> str:
+    """码元几何的稳定文本。v1 黄金哈希用它，半窗随 depth 变。"""
+    lines = []
+    for c in cells:
+        row = (f"{c.idx},{c.track},{c.y0},{c.y1},"
+               f"{c.x_mid:.6f},{c.y_mid:.6f},{c.slope:.8f},{c.width:.4f}")
+        if with_window:
+            row += f",{c.half_win}"
+        lines.append(row)
+    return "\n".join(lines)
 
 
-def _select_stable_cells(cells_seg: List[Tuple], n_cells: int) -> List[Tuple]:
-    """从多余的码元里丢掉更脆的差分对，保留 ``n_cells`` 个，顺序仍按轨迹。"""
-    if len(cells_seg) <= n_cells:
-        return list(cells_seg[:n_cells])
-    if len(cells_seg) % 2 == 1:
-        cells_seg = list(cells_seg[:-1])
-    else:
-        cells_seg = list(cells_seg)
-    pairs = [(cells_seg[i], cells_seg[i + 1]) for i in range(0, len(cells_seg), 2)]
-    ranked = sorted(
-        range(len(pairs)),
-        key=lambda i: (-_pair_fragility(pairs[i][0][1], pairs[i][1][1]), i),
-    )
-    n_drop = len(pairs) - n_cells // 2
-    drop = set(ranked[:n_drop])
-    kept: List[Tuple] = []
-    for i, pair in enumerate(pairs):
-        if i in drop:
-            continue
-        kept.extend(pair)
-    return kept
+def layout_geometry_sha1(cells: Sequence[Cell], *, with_window: bool = True) -> str:
+    token = layout_geometry_token(cells, with_window=with_window)
+    return hashlib.sha1(token.encode("utf-8")).hexdigest()
 
 
-def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: float = MOD_DEPTH,
-                 margin: int = CELL_MARGIN, min_clear: int = MIN_CLEARANCE,
-                 min_track: int = 50) -> List[Cell]:
-    """从二值字形掩膜自动推导码元布局。
-
-    步骤：
-      1) 逐行求墨迹游程（run）；
-      2) 跨行按 x 重叠把游程串成"笔画轨迹（track）"；
-      3) 剔除宽度不稳定 / 与邻笔净空不足 / 过短的轨迹区段；
-      4) 在剩余区段内按目标高度均分 Cell，每轨取偶数个（保证差分对完整）；
-      5) 取前 n_cells 个。
-    """
-    H, W = mask1.shape
+def _ink_rows(mask1: np.ndarray) -> List[List[Tuple[int, int]]]:
     rows: List[List[Tuple[int, int]]] = []
-    for y in range(H):
+    for y in range(mask1.shape[0]):
         r = mask1[y].astype(np.int8)
         dd = np.diff(np.concatenate(([0], r, [0])))
         s = np.where(dd == 1)[0]
         e = np.where(dd == -1)[0]
         rows.append(list(zip(s.tolist(), e.tolist())))
+    return rows
 
-    # ---- 1) 轨迹链接 ----
+
+def _link_tracks(rows: Sequence[Sequence[Tuple[int, int]]]) -> List[List[Tuple[int, int, int, int]]]:
     tracks: List[List[Tuple[int, int, int, int]]] = []
     active: List[Tuple[int, int, int]] = []
-    for y in range(H):
-        runs = rows[y]
+    for y, runs in enumerate(rows):
         new_active: List[Tuple[int, int, int]] = []
         used = set()
         for ri, (s, e) in enumerate(runs):
@@ -898,9 +955,13 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: float = MOD_DEPTH
                 tracks.append([(y, ri, s, e)])
                 new_active.append((len(tracks) - 1, s, e))
         active = new_active
+    return tracks
 
-    # ---- 2) 可用区段 ----
-    intervals: Dict[int, List[List[Tuple[int, float, float]]]] = {}
+
+def _collect_intervals(rows, tracks, *, min_clear: float, min_width: float,
+                       min_track: int, end_trim: int, min_len: int):
+    """连续可用行。点是 (y, center, width, clearance)。"""
+    intervals: Dict[int, List[List[Tuple[int, float, float, float]]]] = {}
     for ti, pts in enumerate(tracks):
         if len(pts) < min_track:
             continue
@@ -908,51 +969,93 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: float = MOD_DEPTH
         med = float(np.median(widths))
         if med < 8:
             continue
-        ok: List[Tuple[int, float, float]] = []
+        ok: List[Tuple[int, float, float, float]] = []
         for (y, ri, s, e) in pts:
             rr = rows[y]
             cl = (s - rr[ri - 1][1]) if ri > 0 else 10 ** 9
             cr = (rr[ri + 1][0] - e) if ri + 1 < len(rr) else 10 ** 9
-            if min(cl, cr) < min_clear:
+            gap = float(min(cl, cr))
+            if gap < min_clear:
                 continue
-            wv = e - s
+            wv = float(e - s)
+            if wv < min_width:
+                continue
             if not (0.85 * med <= wv <= 1.18 * med):
                 continue
-            gap = float(min(cl, cr))
-            ok.append((y, 0.5 * (s + e), float(wv), gap))
-        cur: List[Tuple[int, float, float]] = []
+            ok.append((y, 0.5 * (s + e), wv, gap))
+        cur: List[Tuple[int, float, float, float]] = []
         for item in ok:
             if cur and item[0] == cur[-1][0] + 1:
                 cur.append(item)
             else:
-                if len(cur) >= min_track:
-                    intervals.setdefault(ti, []).append(cur)
+                _store_interval(intervals, ti, cur, end_trim, min_len)
                 cur = [item]
-        if len(cur) >= min_track:
-            intervals.setdefault(ti, []).append(cur)
+        _store_interval(intervals, ti, cur, end_trim, min_len)
+    return intervals
 
+
+def _store_interval(intervals, ti, cur, end_trim: int, min_len: int) -> None:
+    """两端按 END_TRIM 裁，但不要把还能放下一个差分对的区段裁没。"""
+    if len(cur) < min_len:
+        return
+    if end_trim > 0:
+        max_trim = max(0, (len(cur) - min_len) // 2)
+        trim = min(int(end_trim), max_trim)
+        if trim > 0:
+            cur = cur[trim:-trim]
+    if len(cur) >= min_len:
+        intervals.setdefault(ti, []).append(cur)
+
+
+def _cells_from_segment(ti: int, seg: Sequence[Tuple], d: float, margin: int,
+                        idx: int, interval: int, iv_y0: int, iv_y1: int,
+                        risk: float) -> Cell:
+    ys = np.array([p[0] for p in seg], float)
+    cs = np.array([p[1] for p in seg], float)
+    ws = np.array([p[2] for p in seg], float)
+    slope, intercept = np.polyfit(ys, cs, 1)
+    y0 = int(ys[0])
+    y1 = int(ys[-1]) + 1
+    y_mid = 0.5 * (y0 + y1)
+    x_mid = float(slope * y_mid + intercept)
+    wv = float(np.median(ws))
+    hw = int(round(wv * 0.5 + d + margin))
+    clearance = float(min(p[3] for p in seg)) if seg and len(seg[0]) >= 4 else 0.0
+    return Cell(idx=idx, track=ti, y0=y0, y1=y1, x_mid=x_mid, y_mid=y_mid,
+                slope=float(slope), width=wv, half_win=hw, clearance=clearance,
+                interval=interval, iv_y0=iv_y0, iv_y1=iv_y1, pair_risk=risk)
+
+
+def _build_layout_v1(mask1: np.ndarray, n_cells: int, d: float, margin: int,
+                     min_track: int) -> List[Cell]:
+    """布局 v1：锁死 min_clear=20 的旧切分。
+
+    码元怎么选、按什么顺序取前 n_cells，与 depth=1.8 的历史印版一致。
+    ``d`` 只进入测量窗 half_win，所以 v1@6 的位置不变、窗口跟得上 ±6px。
+    差分对仍是轨迹顺序上的相邻格（恒等 PAIR_PERM），允许跨区段。
+    """
+    min_clear = V1_MIN_CLEARANCE
+    rows = _ink_rows(mask1)
+    tracks = _link_tracks(rows)
+    intervals = _collect_intervals(
+        rows, tracks, min_clear=min_clear, min_width=0.0,
+        min_track=min_track, end_trim=0, min_len=min_track)
     if not intervals:
         raise RuntimeError("布局失败：找不到任何可用的笔画区段")
 
-    # 全局宽度基准：并笔处（如 A 顶点两腿汇合）的游程宽度会明显大于笔画标称宽度，
-    # 这类码元的差分基线本身就偏，会变成恒定坏点，必须剔除。
     _allw = [p[2] for segs in intervals.values() for seg in segs for p in seg]
     gmed = float(np.median(_allw)) if _allw else 0.0
 
-    # ---- 3) 分配 Cell ----
-    # 最高的码元往往要靠「净空刚好 22px」的段才能凑满 140。那批段在
-    # ±6px 调制下误码大约是净空 ≥30px 段的两倍。这里把每个目标高度都
-    # 选出一组 140，取脆弱度最低、且码元不要短于 12px 的那组。
-    chosen: List[List[Tuple[int, float, float]]] = []
-    used_h = 0
-    best_cost = None
-    for h_try in range(28, 11, -1):
-        cells_seg: List[Tuple[int, List[Tuple[int, float, float]]]] = []
+    chosen: List[Tuple] = []
+    for h_try in range(28, 6, -1):
+        cells_seg: List[Tuple] = []
         for ti in sorted(intervals):
-            segs: List[List[Tuple[int, float, float]]] = []
-            for iv in intervals[ti]:
+            segs: List[Tuple] = []
+            for iv_i, iv in enumerate(intervals[ti]):
                 n = max(1, int(round(len(iv) / float(h_try))))
                 cuts = np.linspace(0, len(iv), n + 1)
+                iv_y0 = int(iv[0][0])
+                iv_y1 = int(iv[-1][0]) + 1
                 for k in range(n):
                     i0, i1 = int(round(cuts[k])), int(round(cuts[k + 1]))
                     if i1 - i0 < 6:
@@ -960,64 +1063,287 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: float = MOD_DEPTH
                     seg = iv[i0:i1]
                     ws = [p[2] for p in seg]
                     med = float(np.median(ws))
-                    # 码元内宽度必须稳定：差分基线若在漂移，会把调制信号淹掉
                     if med <= 0 or (max(ws) - min(ws)) / med > 0.10:
                         continue
-                    # 宽度必须接近全局基准：并笔/分叉区的游程不是单笔画，不能用
                     if gmed > 0 and abs(med - gmed) / gmed > 0.22:
                         continue
-                    segs.append(seg)
-            if len(segs) % 2 == 1:          # 保证每轨差分对完整
+                    segs.append((iv_i, iv_y0, iv_y1, seg))
+            if len(segs) % 2 == 1:
                 segs = segs[:-1]
-            for sg in segs:
-                cells_seg.append((ti, sg))
-        if len(cells_seg) < n_cells:
-            continue
-        picked = _select_stable_cells(cells_seg, n_cells)
-        heights = [len(sg) for _ti, sg in picked]
-        if not heights or min(heights) < 12:
-            continue
-        pairs = [(picked[i][1], picked[i + 1][1]) for i in range(0, len(picked), 2)]
-        cost = sum(_pair_fragility(a, b) for a, b in pairs)
-        # 同样脆弱时留更高的码元（h_try 从大往小扫，先到的更高）。
-        if best_cost is None or cost + 1e-6 < best_cost:
-            chosen = picked
-            used_h = h_try
-            best_cost = cost
+            cells_seg.extend((ti, item) for item in segs)
+        if len(cells_seg) >= n_cells:
+            chosen = cells_seg[:n_cells]
+            break
     if not chosen:
-        # 兜底：容量不足时全部用上（仍保证偶数）
         cells_seg = []
         for ti in sorted(intervals):
-            for iv in intervals[ti]:
-                cells_seg.append((ti, iv))
+            for iv_i, iv in enumerate(intervals[ti]):
+                cells_seg.append((ti, (iv_i, int(iv[0][0]), int(iv[-1][0]) + 1, iv)))
         if len(cells_seg) % 2 == 1:
             cells_seg = cells_seg[:-1]
         chosen = cells_seg
-        used_h = -1
         if len(chosen) < n_cells:
             raise RuntimeError(f"布局容量不足：仅 {len(chosen)} 个码元 < {n_cells}")
 
     out: List[Cell] = []
-    for i, (ti, seg) in enumerate(chosen):
+    for i, (ti, (iv_i, iv_y0, iv_y1, seg)) in enumerate(chosen):
+        out.append(_cells_from_segment(
+            ti, seg, d, margin, i, iv_i, iv_y0, iv_y1, risk=0.0))
+    return out
+
+
+def _seg_acceptable(seg: Sequence[Tuple], gmed: float) -> bool:
+    if len(seg) < MIN_CELL_H:
+        return False
+    ws = [p[2] for p in seg]
+    med = float(np.median(ws))
+    if med <= 0 or (max(ws) - min(ws)) / med > 0.10:
+        return False
+    if gmed > 0 and abs(med - gmed) / gmed > 0.22:
+        return False
+    return True
+
+
+def _walk_cells(iv: Sequence[Tuple], h_try: int, gmed: float) -> List[Sequence[Tuple]]:
+    """把区段均分成高度约 h_try 的码元，相邻两格高度最多差 1。
+
+    余数摊进前面的格子，避免「短格配一个被尾巴撑长的格」使 |Δy| 超 1.2h。
+    """
+    n = len(iv)
+    target = max(MIN_CELL_H, int(h_try))
+    k = n // target
+    while k > 1 and n / float(k) < MIN_CELL_H:
+        k -= 1
+    if k < 1 or n // k < MIN_CELL_H:
+        return []
+    base, extra = divmod(n, k)
+    segs: List[Sequence[Tuple]] = []
+    i = 0
+    for c in range(k):
+        sz = base + (1 if c < extra else 0)
+        seg = iv[i:i + sz]
+        i += sz
+        if _seg_acceptable(seg, gmed):
+            segs.append(seg)
+    return segs
+
+
+def _predicted_q(seg_a: Sequence[Tuple], seg_b: Sequence[Tuple], depth: float,
+                 iv_y0: int, iv_y1: int) -> float:
+    """几何代理的配对质量。越大越稳。斜笔画和区段端降权，容量不够时不硬删。"""
+    def _one(seg):
         ys = np.array([p[0] for p in seg], float)
         cs = np.array([p[1] for p in seg], float)
-        ws = np.array([p[2] for p in seg], float)
-        slope, intercept = np.polyfit(ys, cs, 1)
-        y0 = int(ys[0])
-        y1 = int(ys[-1]) + 1
-        y_mid = 0.5 * (y0 + y1)
-        x_mid = float(slope * y_mid + intercept)
-        wv = float(np.median(ws))
-        hw = int(round(wv * 0.5 + d + margin))
-        clearance = float(min(p[3] for p in seg)) if seg and len(seg[0]) >= 4 else 0.0
-        out.append(Cell(idx=i, track=ti, y0=y0, y1=y1, x_mid=x_mid,
-                        y_mid=y_mid, slope=float(slope), width=wv, half_win=hw,
-                        clearance=clearance))
+        slope = float(np.polyfit(ys, cs, 1)[0]) if len(ys) >= 2 else 0.0
+        clr = float(min(p[3] for p in seg))
+        return abs(slope), clr, float(ys[-1] - ys[0] + 1.0), float(ys[0]), float(ys[-1])
+    sl_a, cl_a, h_a, y0a, y1a = _one(seg_a)
+    sl_b, cl_b, h_b, y0b, y1b = _one(seg_b)
+    h = min(h_a, h_b)
+    clr = min(cl_a, cl_b)
+    slope = max(sl_a, sl_b)
+    end = min(y0a - iv_y0, (iv_y1 - 1) - y1a, y0b - iv_y0, (iv_y1 - 1) - y1b)
+    floor = max(2.0 * float(depth) + CELL_MARGIN + 2.0, 1.0)
+    q = (clr / floor) * (h / float(MIN_CELL_H))
+    q /= (1.0 + 4.0 * max(0.0, slope - 0.15))
+    if slope > 0.7:
+        q *= 0.45
+    if end < float(depth):
+        q *= 0.55
+    return float(q)
+
+
+def _trim_for_pairs(iv: Sequence[Tuple], end_trim: int, min_h: int, min_len: int):
+    """在 0..END_TRIM 里选裁切：先保差分对数量，再尽量裁满。
+
+    整段都裁满 END_TRIM 时，若干区段会剩奇数个码元，配不成对，140 会不够。
+    只在多裁会少一对时才少裁。
+    """
+    n = len(iv)
+    hi = min(int(end_trim), max(0, (n - min_len) // 2))
+    best_t = 0
+    best_key = None
+    for t in range(0, hi + 1):
+        n_cells = (n - 2 * t) // min_h
+        key = (n_cells // 2, t)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_t = t
+    if best_t:
+        return list(iv[best_t:n - best_t])
+    return list(iv)
+
+
+def _build_layout_v2(mask1: np.ndarray, n_cells: int, d: float, margin: int,
+                     min_track: int) -> List[Cell]:
+    """布局 v2：同区段相邻配对，净空/笔画宽/端裁随深度推导。"""
+    if n_cells % 2:
+        raise RuntimeError("n_cells 必须是偶数")
+    n_pairs = n_cells // 2
+    min_clear = float(min_clearance_for_depth(d))
+    min_w = float(min_stroke_w_for_depth(d))
+    trim = end_trim_for_depth(d)
+    rows = _ink_rows(mask1)
+    tracks = _link_tracks(rows)
+    raw_intervals = _collect_intervals(
+        rows, tracks, min_clear=min_clear, min_width=min_w,
+        min_track=min_track, end_trim=0, min_len=2 * MIN_CELL_H)
+    intervals = {}
+    for ti, segs in raw_intervals.items():
+        kept = []
+        for seg in segs:
+            trimmed = _trim_for_pairs(seg, trim, MIN_CELL_H, 2 * MIN_CELL_H)
+            if len(trimmed) >= 2 * MIN_CELL_H:
+                # 端距相对裁切前的区段，这样 END_TRIM 会计进 dist_to_iv_end。
+                kept.append((trimmed, int(seg[0][0]), int(seg[-1][0]) + 1))
+        if kept:
+            intervals[ti] = kept
+    if not intervals:
+        raise RuntimeError("v2 布局失败：找不到满足净空/笔画宽的区段")
+
+    _allw = [p[2] for segs in intervals.values() for iv, _y0, _y1 in segs for p in iv]
+    gmed = float(np.median(_allw)) if _allw else 0.0
+
+    best = None
+    for h_try in range(28, MIN_CELL_H - 1, -1):
+        pairs = []
+        for ti in sorted(intervals):
+            for iv_i, (iv, iv_y0, iv_y1) in enumerate(intervals[ti]):
+                segs = _walk_cells(iv, h_try, gmed)
+                k = 0
+                while k + 1 < len(segs):
+                    a, b = segs[k], segs[k + 1]
+                    touching = int(b[0][0]) == int(a[-1][0]) + 1
+                    if not touching:
+                        k += 1
+                        continue
+                    q = _predicted_q(a, b, d, iv_y0, iv_y1)
+                    pairs.append((q, ti, iv_i, iv_y0, iv_y1, a, b))
+                    k += 2
+        if len(pairs) < n_pairs:
+            continue
+        ranked = sorted(pairs, key=lambda t: (t[0], t[1], t[5][0][0]))
+        kept = ranked[len(ranked) - n_pairs:]
+        kept.sort(key=lambda t: (t[1], t[5][0][0], t[2]))
+        qs = sorted(t[0] for t in kept)
+        worst_i = max(0, int(math.ceil(0.10 * len(qs))) - 1)
+        key = (qs[worst_i], float(np.median(qs)), h_try)
+        if best is None or key > best[0]:
+            best = (key, kept, h_try)
+    if best is None:
+        raise RuntimeError(
+            f"v2 布局容量不足：同区段、h≥{MIN_CELL_H}、净空≥{min_clear:g}、"
+            f"笔画宽≥{min_w:g} 的差分对少于 {n_pairs}")
+
+    _key, kept, _h = best
+    out: List[Cell] = []
+    for q, ti, iv_i, iv_y0, iv_y1, seg_a, seg_b in kept:
+        risk = 1.0 / max(q, 1e-3)
+        out.append(_cells_from_segment(
+            ti, seg_a, d, margin, len(out), iv_i, iv_y0, iv_y1, risk))
+        out.append(_cells_from_segment(
+            ti, seg_b, d, margin, len(out), iv_i, iv_y0, iv_y1, risk))
+
+    _assert_v2(out, d)
     return out
+
+
+def _assert_v2(cells: Sequence[Cell], d: float) -> None:
+    if len(cells) != N_CELLS:
+        raise RuntimeError(f"v2 码元数 {len(cells)} != {N_CELLS}")
+    min_clear = float(min_clearance_for_depth(d))
+    min_w = float(min_stroke_w_for_depth(d))
+    for i in range(0, len(cells), 2):
+        a, b = cells[i], cells[i + 1]
+        if a.track != b.track or a.interval != b.interval:
+            raise RuntimeError(f"v2 差分对 {i // 2} 跨了区段或轨迹")
+        h = min(a.height, b.height)
+        if h < MIN_CELL_H:
+            raise RuntimeError(f"v2 码元高度 {h} < {MIN_CELL_H}")
+        if abs(a.y_mid - b.y_mid) > 1.2 * h + 1e-6:
+            raise RuntimeError(
+                f"v2 差分对 {i // 2} 的 |Δy|={abs(a.y_mid - b.y_mid):.2f} > 1.2h")
+        if min(a.clearance, b.clearance) + 1e-6 < min_clear:
+            raise RuntimeError(
+                f"v2 净空 {min(a.clearance, b.clearance):.1f} < {min_clear:.0f}")
+        if min(a.width, b.width) + 1e-6 < min_w:
+            raise RuntimeError(
+                f"v2 笔画宽 {min(a.width, b.width):.1f} < {min_w:.0f}")
+
+
+def derive_pair_perm(cells: Sequence[Cell]) -> Tuple[int, ...]:
+    """把几何差分对分进 10 个 Hamming 组。
+
+    最脆的对先发牌，每组先各拿一个，再尽量补不同轨迹、不同字母。
+    返回值 PAIR_PERM[bit] = 几何对编号。v1 不用这个，v1 是恒等置换。
+    组内不再做第二套交织。
+    """
+    n_pairs = len(cells) // 2
+    if n_pairs != N_BITS:
+        raise RuntimeError(f"差分对 {n_pairs} != {N_BITS}")
+    risks = [max(cells[2 * p].pair_risk, cells[2 * p + 1].pair_risk)
+             for p in range(n_pairs)]
+    order = sorted(range(n_pairs), key=lambda p: (-risks[p], p))
+    groups: List[List[int]] = [[] for _ in range(N_BITS // 7)]
+    for p in order:
+        a = cells[2 * p]
+        cands = [g for g in range(len(groups)) if len(groups[g]) < 7]
+
+        def _score(g: int, aa=a, pp=p) -> Tuple:
+            tracks = {cells[2 * q].track for q in groups[g]}
+            letters = {cells[2 * q].letter_i for q in groups[g]}
+            new_tr = 0 if aa.track in tracks else 1
+            new_lt = 0 if aa.letter_i in letters else 1
+            return (new_tr, new_lt, -len(groups[g]), -g)
+
+        groups[max(cands, key=_score)].append(p)
+    perm: List[int] = []
+    for group in groups:
+        perm.extend(sorted(group))
+    if sorted(perm) != list(range(n_pairs)):
+        raise RuntimeError("PAIR_PERM 不是 70 长置换")
+    return tuple(perm)
+
+
+# 默认 v2@6 的冻结置换。由 derive_pair_perm 在该布局上生成一次后写死。
+# 测试会核对它仍等于当前布局的推导结果；对不上就不要悄悄改印版。
+PAIR_PERM_V2: Tuple[int, ...] = (
+    10, 24, 31, 37, 53, 56, 62,
+    6, 20, 33, 41, 55, 61, 67,
+    9, 18, 26, 32, 38, 47, 50,
+    2, 19, 27, 35, 40, 57, 59,
+    5, 13, 14, 25, 48, 64, 68,
+    1, 23, 30, 39, 45, 66, 69,
+    0, 8, 28, 29, 46, 51, 63,
+    3, 11, 16, 22, 36, 60, 65,
+    7, 15, 17, 21, 42, 49, 58,
+    4, 12, 34, 43, 44, 52, 54,
+)
+# v1 @ depth 1.8 的码元几何（含测量窗）。旧印版对得上这个哈希。
+V1_GEOMETRY_SHA1: str = "ed2c4135922d67afd4f507f052ddfc2f7e3f895f"
+
+
+def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: float = MOD_DEPTH,
+                 margin: int = CELL_MARGIN, min_clear: int = MIN_CLEARANCE,
+                 version: int = LAYOUT_VERSION, min_track: int = 50) -> List[Cell]:
+    """从二值字形掩膜推导码元布局。
+
+    version=1 锁死历史印版（min_clear=20，恒等配对），忽略 min_clear。
+    version=2 是默认：同区段配对，净空/笔画宽/端裁由 d 推导。
+    """
+    version = int(version)
+    if version == 1:
+        return _build_layout_v1(mask1, n_cells=n_cells, d=float(d),
+                                margin=int(margin), min_track=min_track)
+    if version == 2:
+        return _build_layout_v2(mask1, n_cells=n_cells, d=float(d),
+                                margin=int(margin), min_track=min_track)
+    raise ValueError(f"未知布局版本 {version}")
 
 
 # ==============================================================================
 # 5. 模块 1：水印嵌入器
+# ==============================================================================
 # ==============================================================================
 
 class WatermarkEmbedder:
@@ -1034,8 +1360,23 @@ class WatermarkEmbedder:
     系数做亚像素混合 —— 混合比例直接等价于边沿位移量，精度可达 1/255 px。
     """
 
-    def __init__(self, design: Optional[ArrowDesign] = None, verbose: bool = True):
-        self.design = design or ArrowDesign(verbose=verbose)
+    def __init__(self, design: Optional[ArrowDesign] = None, verbose: bool = True,
+                 depth: Optional[float] = None, layout_version: Optional[int] = None,
+                 window_pow: Optional[float] = None):
+        if design is None:
+            kw: Dict = {"verbose": verbose}
+            if depth is not None:
+                kw["depth"] = depth
+            if layout_version is not None:
+                kw["layout_version"] = layout_version
+            if window_pow is not None:
+                kw["window_pow"] = window_pow
+            design = ArrowDesign(**kw)
+        elif depth is not None and abs(float(depth) - float(design.depth)) > 1e-6:
+            raise ValueError(
+                f"depth={depth} 与 design.depth={design.depth} 不一致")
+        self.design = design
+        self.depth = float(design.depth)
         self.verbose = verbose
         if len(self.design.cells) != N_CELLS:
             raise RuntimeError(f"布局码元数 {len(self.design.cells)} != {N_CELLS}")
@@ -1067,7 +1408,8 @@ class WatermarkEmbedder:
         if X1 - X0 < 3 or n < 3:
             return
         t = (np.arange(n, dtype=np.float32) + 0.5) / float(n)
-        kk = np.rint(sign * d * np.sin(np.pi * t) ** WINDOW_POW * SS).astype(np.int32)
+        pow_ = float(self.design.window_pow)
+        kk = np.rint(sign * d * np.sin(np.pi * t) ** pow_ * SS).astype(np.int32)
         i = 0
         while i < n:
             j = i + 1
@@ -1087,20 +1429,27 @@ class WatermarkEmbedder:
     def embed(self, digits: str) -> Dict:
         bits = encode_payload(digits)
         mask4 = self.design.mask4.copy()
+        cells = self.design.cells
+        perm = self.design.pair_perm
         for i, b in enumerate(bits):
-            cA = self.design.cells[2 * i]
-            cB = self.design.cells[2 * i + 1]
-            if b == 1:
-                self._apply_cell(mask4, cA, +1, MOD_DEPTH)
-                self._apply_cell(mask4, cB, -1, MOD_DEPTH)
-            else:
-                self._apply_cell(mask4, cA, -1, MOD_DEPTH)
-                self._apply_cell(mask4, cB, +1, MOD_DEPTH)
+            # 只在这里做一次置换。v1 是恒等，不会和别的交织叠两次。
+            p = int(perm[i])
+            cA = cells[2 * p]
+            cB = cells[2 * p + 1]
+            scale = 0.5 * (float(cA.depth_scale) + float(cB.depth_scale))
+            d = self.depth * scale
+            sign = 1 if b == 1 else -1
+            self._apply_cell(mask4, cA, sign, d)
+            self._apply_cell(mask4, cB, -sign, d)
         plate = self.design.render(mask4)
         if self.verbose:
             print(f"[Embed] 载荷 {digits} -> 70 bit 码字 -> {N_CELLS} 个码元，"
-                  f"平滑正弦调制 峰值 ±{MOD_DEPTH:g}px")
-        return {"digits": digits, "bits": bits, "plate": plate, "mask4": mask4}
+                  f"layout=v{self.design.layout_version} "
+                  f"峰值 ±{self.depth:g}px  perm={self.design.pair_perm_id}")
+        return {"digits": digits, "bits": bits, "plate": plate, "mask4": mask4,
+                "depth": self.depth, "layout_version": self.design.layout_version,
+                "pair_perm_id": self.design.pair_perm_id,
+                "window_pow": self.design.window_pow}
 
 
 # ==============================================================================
@@ -1669,7 +2018,9 @@ class WatermarkDecoder:
                     warped, Hf, (CANVAS_W, CANVAS_H),
                     flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
-                return warped, {"cc": float(cc), "motion": int(motion)}
+                shift = float(np.abs(moved - corners.reshape(-1, 2)).max()) / float(sc)
+                return warped, {"cc": float(cc), "motion": int(motion),
+                                "residual": shift}
             else:
                 wf = wm.copy()
                 wf[0, 2] /= sc
@@ -1678,7 +2029,9 @@ class WatermarkDecoder:
                     warped, wf, (CANVAS_W, CANVAS_H),
                     flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_REPLICATE)
-                return warped, {"cc": float(cc), "motion": int(motion)}
+                residual = float(math.hypot(float(wf[0, 2]), float(wf[1, 2])))
+                return warped, {"cc": float(cc), "motion": int(motion),
+                                "residual": residual}
         return warped, {"rejected": True}
 
     def _recover_alignment(self, warped: np.ndarray) -> Tuple[np.ndarray, float]:
@@ -1904,22 +2257,25 @@ class WatermarkDecoder:
         allw = np.concatenate([p[1] for p in prof]) if prof else np.array([1.0])
         self._wmean = float(np.median(allw)) if allw.size else 1.0
 
-        out = np.zeros(len(self.cells), np.float32)
+        out = np.zeros(N_CELLS, np.float32)
+        perm = self.design.pair_perm
+        pow_ = float(self.design.window_pow)
         for i in range(N_BITS):
-            ka, kb = 2 * i, 2 * i + 1
+            p = int(perm[i])
+            ka, kb = 2 * p, 2 * p + 1
             ya, wa = prof[ka]
             yb, wb = prof[kb]
             if len(wa) < 4 or len(wb) < 4:
-                out[ka] = float(wa.mean()) if len(wa) else 0.0
-                out[kb] = float(wb.mean()) if len(wb) else 0.0
+                out[2 * i] = float(wa.mean()) if len(wa) else 0.0
+                out[2 * i + 1] = float(wb.mean()) if len(wb) else 0.0
                 continue
             base = 0.5 * (wa.mean() + wb.mean())
             ta = (ya - self.cells[ka].y0 + 0.5) / float(self.cells[ka].height)
             tb = (yb - self.cells[kb].y0 + 0.5) / float(self.cells[kb].height)
-            sa = np.sin(np.pi * ta) ** WINDOW_POW
-            sb = np.sin(np.pi * tb) ** WINDOW_POW
-            out[ka] = float(((wa - base) * sa).sum() / max(sa.sum(), 1e-6))
-            out[kb] = float(((wb - base) * sb).sum() / max(sb.sum(), 1e-6))
+            sa = np.sin(np.pi * ta) ** pow_
+            sb = np.sin(np.pi * tb) ** pow_
+            out[2 * i] = float(((wa - base) * sa).sum() / max(sa.sum(), 1e-6))
+            out[2 * i + 1] = float(((wb - base) * sb).sum() / max(sb.sum(), 1e-6))
         return out
 
     def _extract_widths_fast(self, warped: np.ndarray) -> np.ndarray:
@@ -1986,22 +2342,25 @@ class WatermarkDecoder:
         allw = np.concatenate([pr[1] for pr in profs]) if profs else np.array([1.0])
         self._wmean = float(np.median(allw)) if allw.size else 1.0
 
-        out = np.zeros(len(self.cells), np.float32)
+        out = np.zeros(N_CELLS, np.float32)
+        perm = self.design.pair_perm
+        pow_ = float(self.design.window_pow)
         for i in range(N_BITS):
-            ka, kb = 2 * i, 2 * i + 1
+            p = int(perm[i])
+            ka, kb = 2 * p, 2 * p + 1
             ya, wa = profs[ka]
             yb, wb = profs[kb]
             if len(wa) < 4 or len(wb) < 4:
-                out[ka] = float(wa.mean()) if len(wa) else 0.0
-                out[kb] = float(wb.mean()) if len(wb) else 0.0
+                out[2 * i] = float(wa.mean()) if len(wa) else 0.0
+                out[2 * i + 1] = float(wb.mean()) if len(wb) else 0.0
                 continue
             base = 0.5 * (wa.mean() + wb.mean())
             ta = (ya - self.cells[ka].y0 + 0.5) / float(self.cells[ka].height)
             tb = (yb - self.cells[kb].y0 + 0.5) / float(self.cells[kb].height)
-            sa = np.sin(np.pi * ta) ** WINDOW_POW
-            sb = np.sin(np.pi * tb) ** WINDOW_POW
-            out[ka] = float(((wa - base) * sa).sum() / max(sa.sum(), 1e-6))
-            out[kb] = float(((wb - base) * sb).sum() / max(sb.sum(), 1e-6))
+            sa = np.sin(np.pi * ta) ** pow_
+            sb = np.sin(np.pi * tb) ** pow_
+            out[2 * i] = float(((wa - base) * sa).sum() / max(sa.sum(), 1e-6))
+            out[2 * i + 1] = float(((wb - base) * sb).sum() / max(sb.sum(), 1e-6))
         return out
 
     def extract_masses(self, warped: np.ndarray) -> np.ndarray:
@@ -2027,18 +2386,29 @@ class WatermarkDecoder:
     def decide_bits(self, feat: np.ndarray) -> Tuple[List[int], np.ndarray]:
         """差分判决：M[2i] - M[2i+1] > 0 -> bit 1。
 
-        去趋势后 feat 是相对基线的偏移量，因此用"笔画中位宽度"归一化：
-        conf = d / (2*w_mean)，满调制时约为 3.14*d/(2*w) ≈ 0.075。
+        ``conf`` 仍是像素差分除以笔画中位宽度，留给旧日志。
+        ``_soft_n`` 再除以期望幅度 π·depth·scale，满调制约 ±1。
+        生产门和软判决用 ``_soft_n``，不拿 1.8px 时期的绝对 conf 当门限。
         """
         bits: List[int] = []
         conf: List[float] = []
+        soft_n: List[float] = []
         wm_ = max(float(getattr(self, "_wmean", 1.0)), 1.0)
+        perm = self.design.pair_perm
+        depth = float(self.design.depth)
         for i in range(N_BITS):
             a = float(feat[2 * i])
             b = float(feat[2 * i + 1])
-            d = a - b
-            bits.append(1 if d > 0 else 0)
-            conf.append(d / (2.0 * wm_))
+            dlt = a - b
+            bits.append(1 if dlt > 0 else 0)
+            conf.append(dlt / (2.0 * wm_))
+            p = int(perm[i])
+            cA = self.cells[2 * p]
+            cB = self.cells[2 * p + 1]
+            scale = 0.5 * (float(cA.depth_scale) + float(cB.depth_scale))
+            exp = expected_differential_px(depth * scale)
+            soft_n.append(dlt / exp if exp > 1e-9 else 0.0)
+        self._soft_n = np.array(soft_n, np.float32)
         return bits, np.array(conf, np.float32)
 
     # ---------------- 主入口 ----------------
@@ -2095,27 +2465,40 @@ class WatermarkDecoder:
         if not r.get("ok"):
             return {"ok": False, "reason": r.get("reason", "rectify_failed"),
                     "digits": None, "bits": None, "ber": 1.0, "conf": 0.0,
-                    "mean_conf": 0.0, "n_corrected": 0}
+                    "soft_n": None, "mean_conf": 0.0, "mean_soft_n": 0.0,
+                    "n_corrected": 0, "reg_ok": False, "reg_residual": 1.0}
         warped = r["warped"]
         feat = self.extract_widths(warped)
         bits, conf = self.decide_bits(feat)
+        soft_n = np.asarray(self._soft_n, np.float32)
         digits_hard, n_corr, flags = decode_payload(bits)
         if self.use_soft_decode:
-            # 软判决最大似然：把每比特的置信度都用上，一组内 2 位错也能救回
-            digits, n_corr = decode_payload_soft(conf)
+            # 软判决用按期望幅度归一化后的 soft_n。scale 恒为 1 时与 conf 只差一个正的常数。
+            digits, n_corr = decode_payload_soft(soft_n)
         else:
             digits = digits_hard
         ecc = dict(r.get("ecc", {}))
         ecc.setdefault("cc", 0.0)          # ECC 被拒时也给出明确的 0
+        cc = float(ecc.get("cc", 0.0))
+        if ecc.get("residual") is None:
+            residual = max(0.0, 1.0 - cc)
+        else:
+            residual = float(ecc.get("residual"))
+        reg_ok = bool(cc >= 0.85) if self.use_ecc_refine else True
         out = {"ok": True, "digits": digits, "digits_hard": digits_hard,
                "payload_valid": digits is not None,
-               "bits": bits, "conf": conf,
+               "bits": bits, "conf": conf, "soft_n": soft_n,
                "widths": feat, "n_corrected": n_corr,
                "mean_conf": float(np.mean(np.abs(conf))),
-               "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
+               "mean_soft_n": float(np.mean(np.abs(soft_n))),
+               "ecc": ecc, "cc": cc,
+               "reg_ok": reg_ok, "reg_residual": residual,
+               "layout_version": self.design.layout_version,
+               "depth": float(self.design.depth),
+               "pair_perm_id": self.design.pair_perm_id,
                "logo_scale": float(r.get("logo_scale", 1.0)),
                "warped": warped if return_debug else None}
-        out.update(readout_qc(conf, bits, soft=self.use_soft_decode))
+        out.update(readout_qc(soft_n, bits, soft=self.use_soft_decode))
         if return_debug:
             out["H"] = r["H"]
         return out
@@ -2144,7 +2527,7 @@ class WatermarkDecoder:
 
         def _rank(d):
             return (1 if d.get("cc", 0.0) >= CC_GATE else 0,
-                    d.get("mean_conf", 0.0))
+                    d.get("mean_soft_n", 0.0))
 
         plates = self._plate_candidates(gray, k=3)
         # 小卡片判定：最大亮连通域面积 < 画面 45%，且画幅明显大于底版
@@ -2165,15 +2548,15 @@ class WatermarkDecoder:
             if best is None or _rank(res) > _rank(best):
                 best = res
 
-        def _good_enough(gate_cc: float, gate_conf: float) -> bool:
+        def _good_enough(gate_cc: float, gate_soft_n: float) -> bool:
             return (best is not None
                     and best.get("cc", 0.0) >= gate_cc
-                    and best.get("mean_conf", 0.0) >= gate_conf)
+                    and best.get("mean_soft_n", 0.0) >= gate_soft_n)
 
         if not plate_first:
             _consider(self._decode_gray(gray, return_debug), "full")
             # 整幅已经解得又稳又准，就不必再花时间定位了
-            if _good_enough(0.95, 0.030):
+            if _good_enough(0.95, SOFT_N_PATH_GATE):
                 return best
 
         for k, cand in enumerate(plates):
@@ -2182,7 +2565,7 @@ class WatermarkDecoder:
                 continue
             _consider(self._decode_gray(cand, return_debug), f"plate#{k}",
                       isolated=True)
-            if _good_enough(CC_GATE, 0.030):
+            if _good_enough(CC_GATE, SOFT_N_PATH_GATE):
                 return best
 
         # 小卡片优先时，若卡片路径不够好，再补整幅兜底
@@ -2196,6 +2579,106 @@ class WatermarkDecoder:
             "bits": None, "ber": 1.0, "conf": 0.0, "mean_conf": 0.0,
             "n_corrected": 0, "path": "none",
         }
+
+def make_payloads(n_payloads: int, seed: int) -> List[str]:
+    """压测号码。首尾不用 0，同一 seed 在各消融配置之间可以对照。"""
+    rng = np.random.default_rng(seed)
+    digits_list: List[str] = []
+    while len(digits_list) < n_payloads:
+        d = "".join(str(x) for x in rng.integers(0, 10, size=PAYLOAD_DIGITS))
+        if d[0] == "0":
+            d = "1" + d[1:]
+        digits_list.append(d)
+    return digits_list
+
+
+PAIR_DUMP_FIELDS = (
+    "seed", "level", "payload", "layout", "depth", "reg_ok", "reg_residual",
+    "pair_id", "bit_idx", "group_id", "cell_a", "cell_b", "track", "letter",
+    "y_mid", "h", "slope", "width", "clr_min", "dist_to_iv_end", "straddle",
+    "soft", "soft_n", "bit_err", "group_gap",
+)
+
+
+def pair_dump_rows(res: Dict, tx_bits: Sequence[int], *, seed: int, level: str,
+                   payload: str, design: "ArrowDesign") -> List[Dict]:
+    """一个样本的 70 行。配准失败也落盘，信号型统计时再按 reg_ok 过滤。"""
+    perm = design.pair_perm
+    cells = design.cells
+    conf = res.get("conf")
+    conf_a = np.zeros(N_BITS, np.float64) if conf is None else np.asarray(conf, np.float64).ravel()
+    soft = res.get("soft_n")
+    soft_a = np.zeros(N_BITS, np.float64) if soft is None else np.asarray(soft, np.float64).ravel()
+    bits = res.get("bits") or []
+    gaps = res.get("group_margins") or []
+    rows: List[Dict] = []
+    for i in range(N_BITS):
+        p = int(perm[i])
+        a = cells[2 * p]
+        b = cells[2 * p + 1]
+        if res.get("ok") and i < len(bits) and i < len(tx_bits):
+            bit_err = int(int(bits[i]) != int(tx_bits[i]))
+        else:
+            bit_err = 1
+        g = i // 7
+        rows.append({
+            "seed": int(seed),
+            "level": level,
+            "payload": payload,
+            "layout": int(design.layout_version),
+            "depth": float(design.depth),
+            "reg_ok": int(bool(res.get("reg_ok"))),
+            "reg_residual": float(res.get("reg_residual") or 0.0),
+            "pair_id": p,
+            "bit_idx": i,
+            "group_id": g,
+            "cell_a": int(a.idx),
+            "cell_b": int(b.idx),
+            "track": int(a.track),
+            "letter": a.letter,
+            "y_mid": round(0.5 * (a.y_mid + b.y_mid), 3),
+            "h": int(min(a.height, b.height)),
+            "slope": round(max(abs(a.slope), abs(b.slope)), 4),
+            "width": round(min(a.width, b.width), 3),
+            "clr_min": round(min(a.clearance, b.clearance), 3),
+            "dist_to_iv_end": round(min(a.dist_to_iv_end(), b.dist_to_iv_end()), 3),
+            "straddle": int(a.track != b.track or a.interval != b.interval),
+            "soft": round(float(conf_a[i]) if i < conf_a.size else 0.0, 6),
+            "soft_n": round(float(soft_a[i]) if i < soft_a.size else 0.0, 6),
+            "bit_err": bit_err,
+            "group_gap": round(float(gaps[g]) if g < len(gaps) else 0.0, 4),
+        })
+    return rows
+
+
+def summarize_pair_rows(rows: Sequence[Dict]) -> Dict:
+    """只在配准合格的行上算 μ/σ/Q。aligned soft_n 朝真值比特取正。"""
+    ok = [r for r in rows if int(r.get("reg_ok", 0)) == 1]
+    by_pair: Dict[int, List[float]] = {}
+    for r in ok:
+        # 对齐到真值方向：判对取 |soft_n|，判错取负。真 bit 为 0 时 soft_n 本身是负的。
+        measured = abs(float(r["soft_n"]))
+        aligned = measured if int(r["bit_err"]) == 0 else -measured
+        by_pair.setdefault(int(r["pair_id"]), []).append(aligned)
+    stats = []
+    for pid, vals in sorted(by_pair.items()):
+        arr = np.asarray(vals, np.float64)
+        mu = float(arr.mean()) if arr.size else 0.0
+        sd = float(arr.std()) if arr.size else 0.0
+        q = mu / sd if sd > 1e-9 else (99.0 if mu > 0 else 0.0)
+        stats.append({"pair_id": pid, "mu": mu, "sigma": sd, "q": q, "n": int(arr.size)})
+    mus = [s["mu"] for s in stats]
+    qs = sorted(s["q"] for s in stats)
+    worst_i = max(0, int(math.ceil(0.10 * len(qs))) - 1) if qs else 0
+    return {
+        "n_rows_reg_ok": len(ok),
+        "n_pairs": len(stats),
+        "mu_median": float(np.median(mus)) if mus else 0.0,
+        "mu_min": float(min(mus)) if mus else 0.0,
+        "q_worst10": float(qs[worst_i]) if qs else 0.0,
+        "pairs": stats,
+    }
+
 
 def _production_gate(res: Dict, decoder: "WatermarkDecoder"):
     """把研究解码器的一次结果送进 ``arrow_decode`` 的接受门。
@@ -2222,23 +2705,30 @@ class BenchmarkRunner:
         self.out_dir = out_dir
 
     def run(self, n_payloads: int = 50, seed: int = 7,
-            levels: Sequence[str] = LEVEL_ORDER) -> Dict:
-        rng = np.random.default_rng(seed)
-        digits_list = []
-        while len(digits_list) < n_payloads:
-            d = "".join(str(x) for x in rng.integers(0, 10, size=PAYLOAD_DIGITS))
-            if d[0] == "0":
-                d = "1" + d[1:]
-            digits_list.append(d)
+            levels: Sequence[str] = LEVEL_ORDER,
+            payloads: Optional[Sequence[str]] = None,
+            dump_pairs: Optional[str] = None) -> Dict:
+        digits_list = list(payloads) if payloads is not None else make_payloads(
+            n_payloads, seed)
+        n_payloads = len(digits_list)
+        design = self.embedder.design
 
         stats = {lv: {"n": 0, "bits": 0, "err": 0, "ok": 0, "conf": [],
                       "fail": 0, "corr": 0, "accept_correct": 0,
-                      "accept_wrong": 0, "rejected": 0} for lv in levels}
+                      "accept_wrong": 0, "rejected": 0, "reg_ok": 0,
+                      "reg_ok_correct": 0, "residuals": []} for lv in levels}
         t0 = time.time()
         total = n_payloads * len(levels)
         done = 0
         old_verbose = self.embedder.verbose
         self.embedder.verbose = False          # 压测期间关闭逐条日志，避免打断进度条
+        dump_fh = None
+        writer = None
+        if dump_pairs:
+            _ensure_dir(os.path.dirname(os.path.abspath(dump_pairs)) or ".")
+            dump_fh = open(dump_pairs, "w", encoding="utf-8", newline="")
+            writer = csv.DictWriter(dump_fh, fieldnames=PAIR_DUMP_FIELDS)
+            writer.writeheader()
         try:
             for pi, digits in enumerate(digits_list):
                 wm = self.embedder.embed(digits)
@@ -2251,6 +2741,11 @@ class BenchmarkRunner:
                     st = stats[lv]
                     st["n"] += 1
                     st["bits"] += N_BITS
+                    if res.get("reg_ok"):
+                        st["reg_ok"] += 1
+                        st["residuals"].append(float(res.get("reg_residual") or 0.0))
+                        if res.get("digits") == digits:
+                            st["reg_ok_correct"] += 1
                     if res["ok"]:
                         rx = np.array(res["bits"], np.int8)
                         st["err"] += int((rx != tx_bits).sum())
@@ -2271,6 +2766,11 @@ class BenchmarkRunner:
                         st["accept_wrong"] += 1
                     else:
                         st["rejected"] += 1
+                    if writer is not None:
+                        for row in pair_dump_rows(
+                                res, tx_bits, seed=seed, level=lv,
+                                payload=digits, design=design):
+                            writer.writerow(row)
                     done += 1
                     if done % 25 == 0 or done == total:
                         el = time.time() - t0
@@ -2279,14 +2779,21 @@ class BenchmarkRunner:
                         sys.stdout.flush()
         finally:
             self.embedder.verbose = old_verbose
+            if dump_fh is not None:
+                dump_fh.close()
         sys.stdout.write("\n")
         elapsed = time.time() - t0
 
         report = {"n_payloads": n_payloads, "levels": list(levels),
-                  "elapsed": elapsed, "stats": {}}
+                  "elapsed": elapsed, "seed": seed,
+                  "layout": design.layout_version, "depth": design.depth,
+                  "window_pow": design.window_pow,
+                  "pair_perm_id": design.pair_perm_id,
+                  "dump_pairs": dump_pairs, "stats": {}}
         for lv in levels:
             st = stats[lv]
             n = max(1, st["n"])
+            resids = st["residuals"]
             report["stats"][lv] = {
                 "n": st["n"],
                 "ber": st["err"] / max(1, st["bits"]),
@@ -2296,10 +2803,21 @@ class BenchmarkRunner:
                 "accept_and_wrong_rate": st["accept_wrong"] / n,
                 "rejected": st["rejected"],
                 "research_success": st["ok"] / n,
+                "reg_ok": st["reg_ok"],
+                "reg_ok_rate": st["reg_ok"] / n,
+                "reg_ok_correct": st["reg_ok_correct"],
+                "reg_ok_correct_rate": (st["reg_ok_correct"] / st["reg_ok"]
+                                        if st["reg_ok"] else 0.0),
+                "reg_residual_p50": (float(np.percentile(resids, 50))
+                                     if resids else None),
+                "reg_residual_p95": (float(np.percentile(resids, 95))
+                                     if resids else None),
                 "mean_conf": float(np.mean(st["conf"])) if st["conf"] else 0.0,
                 "mean_corrected": st["corr"] / max(1, st["n"]),
             }
         report["gate"] = "arrow_decode"
+        report["accept_and_wrong_total"] = int(sum(
+            report["stats"][lv]["accept_and_wrong"] for lv in levels))
         return report
 
     # ---------------- 终端表格 ----------------
@@ -2670,23 +3188,96 @@ def _print_decode_line(name: str, res, dt: float) -> None:
     print(f"  {name:<32} -> 拒绝（{AD.reason_text(res.reason)}）  {extra}   {tail}")
 
 
+# 同一批号码、同一个种子。pow2 只改窗，不降 depth。
+ABLATION_CONFIGS = (
+    ("v1@1.8", 1, V1_DEPTH, 1.0),
+    ("v1@6", 1, MOD_DEPTH, 1.0),
+    ("v2@6", 2, MOD_DEPTH, 1.0),
+    ("v2@6+pow2", 2, MOD_DEPTH, 2.0),
+)
+
+
+def run_ablation(n_payloads: int, seed: int, levels: Sequence[str], out_dir: str,
+                 use_ecc_refine: bool = True) -> List[Dict]:
+    """v1@1.8 / v1@6 / v2@6 / v2@6+pow2。号码列表共用。"""
+    payloads = make_payloads(n_payloads, seed)
+    sim = CeramicCamSimulator(seed=seed)
+    reports: List[Dict] = []
+    for name, layout, depth, pow_ in ABLATION_CONFIGS:
+        print(f"\n==== 消融 {name}  layout={layout} depth={depth:g} window={pow_:g} ====")
+        design = ArrowDesign(verbose=False, depth=depth, layout_version=layout,
+                             window_pow=pow_)
+        embedder = WatermarkEmbedder(design, verbose=False)
+        decoder = WatermarkDecoder(design, use_ecc_refine=use_ecc_refine, verbose=False)
+        dump = os.path.join(out_dir, f"pairs_{name.replace('@', '_').replace('+', '_')}.csv")
+        rep = BenchmarkRunner(embedder, sim, decoder, out_dir).run(
+            n_payloads, seed=seed, levels=levels, payloads=payloads, dump_pairs=dump)
+        rep["name"] = name
+        rows = []
+        with open(dump, encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        rep["pairs"] = summarize_pair_rows(rows)
+        reports.append(rep)
+        BenchmarkRunner.print_report(rep)
+        print(f"  配对准样本 μ 中位 {rep['pairs']['mu_median']:.3f}  "
+              f"最差 {rep['pairs']['mu_min']:.3f}  "
+              f"最差 10% Q {rep['pairs']['q_worst10']:.3f}")
+    return reports
+
+
+def _parse_levels(text: Optional[str]) -> List[str]:
+    if not text:
+        return list(LEVEL_ORDER)
+    out = []
+    for part in text.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        if name not in LEVELS:
+            raise SystemExit(f"未知扰动档 {name}，可选 {', '.join(LEVEL_ORDER)}")
+        out.append(name)
+    return out or list(LEVEL_ORDER)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="ARROW 陶瓷 Logo 隐形水印：嵌入 / 物理信道模拟 / 盲解码")
     ap.add_argument("--demo", action="store_true", help="只跑单条演示")
     ap.add_argument("--bench", action="store_true", help="只跑压力测试")
+    ap.add_argument("--ablation", action="store_true",
+                    help="跑 v1@1.8 / v1@6 / v2@6 / v2@6+pow2")
     ap.add_argument("--all", action="store_true", help="演示 + 压力测试（默认）")
     ap.add_argument("-n", "--num", type=int, default=50, help="压测号码组数（默认 50）")
     ap.add_argument("--digits", type=str, default="13800138000", help="演示用 11 位号码")
     ap.add_argument("--seed", type=int, default=7, help="压测随机种子")
     ap.add_argument("--out", type=str, default=OUT_DIR, help="输出目录")
+    ap.add_argument("--depth", type=float, default=None,
+                    help=f"边缘调制深度 px，默认 {MOD_DEPTH:g}")
+    ap.add_argument("--layout", default=None,
+                    help="嵌入 1 或 2（默认 2）；解码还可以是 auto，先试 v2")
+    ap.add_argument("--window-pow", type=float, default=None,
+                    help="调制窗指数，1=sin，2=sin^2。默认 1")
+    ap.add_argument("--levels", default=None,
+                    help="逗号分隔的扰动档，默认 clean,light,moderate,heavy,extreme")
+    ap.add_argument("--dump-pairs", default=None,
+                    help="把每个差分对的几何和 soft_n 写成 CSV")
     ap.add_argument("--no-ecc", action="store_true", help="关闭 ECC 亚像素精配")
     ap.add_argument("--decode", metavar="IMAGE", nargs="+", default=None,
                     help="解码实拍照片（可一次给多张）")
     args = ap.parse_args(argv)
 
-    do_demo = args.demo or args.all or (not args.demo and not args.bench)
-    do_bench = args.bench or args.all or (not args.demo and not args.bench)
+    explicit = args.demo or args.bench or args.ablation or args.decode
+    do_demo = args.demo or args.all or not explicit
+    do_bench = args.bench or args.all or not explicit
+    if args.ablation or args.decode:
+        if not args.demo:
+            do_demo = False
+        if not args.bench and not args.all:
+            do_bench = False
+
+    depth = MOD_DEPTH if args.depth is None else float(args.depth)
+    window_pow = WINDOW_POW if args.window_pow is None else float(args.window_pow)
+    layout_text = "2" if args.layout is None else str(args.layout).strip().lower()
 
     if args.decode:
         # 生产门限走 arrow_decode。--no-ecc 关闭 ECC，研究解码器不计算 cc
@@ -2694,15 +3285,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # 默认路径生产门全开。压测在 BenchmarkRunner 里对同一次研究解码
         # 再过 arrow_decode.apply_gate，并统计接受且错号。
         import arrow_decode as AD
-        session = AD.Decoder(
-            carrier="edge",
-            use_ecc_refine=not args.no_ecc)
+        if layout_text not in ("1", "2", "auto"):
+            raise SystemExit("--layout 解码时只能是 1、2 或 auto")
+        sessions = {}
+
+        def _session(layout_version: int, used_depth: float):
+            key = (layout_version, used_depth)
+            if key not in sessions:
+                sessions[key] = AD.Decoder(
+                    carrier="edge",
+                    layout_version=layout_version,
+                    depth=used_depth,
+                    window_pow=window_pow,
+                    use_ecc_refine=not args.no_ecc)
+            return sessions[key]
+
         print("=" * 74)
         if args.no_ecc:
             cc_note = "cc 门关闭（--no-ecc 不计算配准分）"
         else:
             cc_note = f"cc ≥ {AD.CC_THRESHOLD:g}"
-        print(f"  实拍照片解码（边缘载体）  裕度均值 ≥ {AD.MARGIN_THRESHOLD:g}"
+        print(f"  实拍照片解码（边缘载体）  layout={layout_text}  depth={depth:g}"
+              f"  裕度均值 ≥ {AD.MARGIN_THRESHOLD:g}"
               f"  单组最小 ≥ {AD.MIN_GROUP_MARGIN:g}  {cc_note}")
         print("=" * 74)
         for path in args.decode:
@@ -2711,11 +3315,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"  {path}  ->  读不到文件")
                 continue
             t0 = time.time()
-            res = session.decode(img)
+            if layout_text == "auto":
+                res = _session(2, depth).decode(img)
+                if not res.accepted:
+                    older = _session(1, V1_DEPTH).decode(img)
+                    if older.accepted or older.margin > res.margin:
+                        res = older
+            else:
+                used = V1_DEPTH if layout_text == "1" and args.depth is None else depth
+                res = _session(int(layout_text), used).decode(img)
             dt = time.time() - t0
             _print_decode_line(os.path.basename(path), res, dt)
         print("=" * 74)
         return 0
+
+    if layout_text not in ("1", "2"):
+        raise SystemExit("嵌入 / 压测的 --layout 只能是 1 或 2")
+    layout_version = int(layout_text)
+    if layout_version == 1 and args.depth is None and not args.ablation:
+        # 不显式给深度时，v1 印版用冻结的 1.8。v1@6 要写 --layout 1 --depth 6。
+        depth = V1_DEPTH
 
     out_dir = _ensure_dir(args.out)
     print("=" * 96)
@@ -2725,25 +3344,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  底版 {CANVAS_W}x{CANVAS_H}px（{CANVAS_W / 1000:.1f}cm x {CANVAS_H / 1000:.1f}cm @1000px/cm）")
     print(f"  载荷 {PAYLOAD_BITS} bit -> Hamming(7,4) -> {N_BITS} bit -> {N_CELLS} 个码元")
 
+    if args.ablation:
+        levels = _parse_levels(args.levels)
+        reports = run_ablation(args.num, args.seed, levels, out_dir,
+                               use_ecc_refine=not args.no_ecc)
+        wrong = sum(int(r.get("accept_and_wrong_total", 0)) for r in reports)
+        slim = []
+        for rep in reports:
+            item = {k: rep[k] for k in (
+                "name", "n_payloads", "levels", "elapsed", "seed", "layout",
+                "depth", "window_pow", "pair_perm_id", "accept_and_wrong_total",
+                "stats")}
+            item["mu_median"] = rep["pairs"]["mu_median"]
+            item["mu_min"] = rep["pairs"]["mu_min"]
+            item["q_worst10"] = rep["pairs"]["q_worst10"]
+            slim.append(item)
+        with open(os.path.join(out_dir, "ablation_report.json"), "w", encoding="utf-8") as f:
+            json.dump({"accept_and_wrong_total": wrong, "runs": slim},
+                      f, ensure_ascii=False, indent=2)
+        print(f"\n消融接受且错号合计 {wrong}。输出目录：{os.path.abspath(out_dir)}\n")
+        return 0
+
     t0 = time.time()
-    design = ArrowDesign(verbose=True)
+    design = ArrowDesign(verbose=True, depth=depth, layout_version=layout_version,
+                         window_pow=window_pow)
     embedder = WatermarkEmbedder(design, verbose=True)
     sim = CeramicCamSimulator(seed=20240501)
     decoder = WatermarkDecoder(design, use_ecc_refine=not args.no_ecc, verbose=True)
     print(f"  初始化耗时 {time.time() - t0:.2f}s")
+    print(f"  layout=v{design.layout_version}  depth={design.depth:g}  "
+          f"window={design.window_pow:g}  perm={design.pair_perm_id}")
 
     if do_demo:
         run_demo(embedder, sim, decoder, args.digits, out_dir)
 
     if do_bench:
+        levels = _parse_levels(args.levels)
         runner = BenchmarkRunner(embedder, sim, decoder, out_dir)
-        rep = runner.run(args.num, seed=args.seed)
+        rep = runner.run(args.num, seed=args.seed, levels=levels,
+                         dump_pairs=args.dump_pairs)
         runner.print_report(rep)
         p4 = os.path.join(out_dir, "4_benchmark_report.png")
         figure_benchmark(rep, p4)
         print(f"  [输出] {p4}")
         with open(os.path.join(out_dir, "benchmark_report.json"), "w", encoding="utf-8") as f:
             json.dump(rep, f, ensure_ascii=False, indent=2)
+        if args.dump_pairs:
+            print(f"  [输出] {args.dump_pairs}")
 
     print(f"\n全部完成，输出目录：{os.path.abspath(out_dir)}\n")
     return 0

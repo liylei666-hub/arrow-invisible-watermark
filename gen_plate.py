@@ -64,6 +64,10 @@ def main(argv=None) -> int:
     ap.add_argument("-d", "--outdir", default=".", help="批量时的输出目录")
     ap.add_argument("--1bit", dest="onebit", action="store_true",
                     help="同时输出 1bit 二值版（供只收位图的制版流程）")
+    ap.add_argument("--depth", type=float, default=None,
+                    help=f"边缘调制深度，默认 {A.MOD_DEPTH:g}；--layout 1 且不写时用 {A.V1_DEPTH:g}")
+    ap.add_argument("--layout", type=int, choices=(1, 2), default=2,
+                    help="边缘布局版本，1=冻结旧印版，2=当前默认")
     ap.add_argument("--no-check", action="store_true", help="跳过生成后的自检解码")
     args = ap.parse_args(argv)
 
@@ -72,7 +76,12 @@ def main(argv=None) -> int:
     if len(payloads) > 1 and args.out:
         raise SystemExit("多个号码时请用 -d 指定输出目录，不要用 -o")
 
-    design = A.ArrowDesign()
+    depth = args.depth
+    if depth is None and args.layout == 1:
+        depth = A.V1_DEPTH
+    elif depth is None:
+        depth = A.MOD_DEPTH
+    design = A.ArrowDesign(depth=depth, layout_version=args.layout, verbose=False)
     emb = {"edge": A.WatermarkEmbedder(design, verbose=False)}
     # 自检走生产门：号码对得上且 accepted 才算 OK。干净印版应同时过裕度与 cc。
     dec = {"edge": AD.Decoder(carrier="edge", design=design)}

@@ -115,6 +115,20 @@ class GateTests(unittest.TestCase):
         self.assertFalse(still_gated.accepted)
         self.assertIn("low_cc", still_gated.reason)
 
+    def test_tiny_logo_is_rejected_without_becoming_a_number(self):
+        raw = {
+            "ok": True, "digits": "61960679562", "payload_valid": True,
+            "margin": 4.2, "margin_min": 3.0, "cc": 0.97,
+            "mean_conf": 0.01, "logo_scale": 0.077,
+        }
+        result = AD.apply_gate(raw, carrier="edge")
+        self.assertFalse(result.accepted, result.public_dict())
+        self.assertIsNone(result.digits)
+        self.assertEqual(result.candidate_digits, "61960679562")
+        self.assertIn("low_logo_scale", result.reason)
+        self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
+        self.assertLess(result.logo_scale, AD.LOGO_SCALE_MIN)
+
     def test_clear_read_is_accepted(self):
         raw = {
             "ok": True, "digits": "13800138000", "payload_valid": True,
@@ -362,8 +376,8 @@ class ServiceContractTests(unittest.TestCase):
             "margin": 4.2, "cc": 0.96, "mean_conf": 0.05, "logo_scale": 1.0,
         }
 
-        def fake(carrier, gray):
-            self.calls.append((carrier, int(gray.size)))
+        def fake(carrier, gray, layout="2"):
+            self.calls.append((carrier, int(gray.size), layout))
             if gray.size == 0:
                 raw = {"ok": False, "reason": "unreadable", "digits": None}
             else:
@@ -436,7 +450,7 @@ class ServiceContractTests(unittest.TestCase):
         self.assertEqual(body["reason"], "")
         self.assertEqual(body["reason_text"], "接受")
         self.assertTrue(body["ok"])
-        self.assertEqual(self.calls, [("edge", 1)])
+        self.assertEqual(self.calls, [("edge", 1, "2")])
 
     def test_reject_omits_candidate_and_ok_is_not_success(self):
         self.raw = {
@@ -518,6 +532,14 @@ class ServiceContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.calls[0][0], "inner")
 
+    def test_bad_layout_is_an_http_error(self):
+        response = self._post("/decode?layout=9")
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["status"], "error")
+        self.assertIn("layout", body["detail"])
+        self.assertEqual(self.calls, [])
+
     def test_bad_carrier_and_missing_image(self):
         bad = self.client.post(
             "/decode?carrier=both",
@@ -548,7 +570,7 @@ class ServiceContractTests(unittest.TestCase):
         self.assertNotIn("candidate_digits", body)
         self.assertEqual(body["reason"], "unreadable")
         self.assertEqual(body["reason_text"], "读不到图像")
-        self.assertEqual(self.calls, [("edge", 0)])
+        self.assertEqual(self.calls, [("edge", 0, "2")])
 
     def test_token_guards_decode_but_not_health(self):
         os.environ["DECODE_TOKEN"] = "devsecret"
@@ -581,7 +603,7 @@ class ServiceContractTests(unittest.TestCase):
         self.assertEqual(body["digits"], "13800138000")
         self.assertNotIn("candidate_digits", body)
         self.assertEqual(body["carrier"], "inner")
-        self.assertEqual(self.calls, [("inner", 1)])
+        self.assertEqual(self.calls, [("inner", 1, "2")])
 
     def test_json_query_carrier_beats_body_and_data_url(self):
         payload = "data:image/png;base64," + base64.b64encode(_PNG_1X1).decode("ascii")
@@ -626,7 +648,7 @@ class ServiceContractTests(unittest.TestCase):
             headers={"content-type": "image/png"},
         )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.calls, [("inner", 1)])
+        self.assertEqual(self.calls, [("inner", 1, "2")])
         empty = self.client.post(
             "/decode",
             content=b"",
@@ -691,6 +713,90 @@ class CloudRunPackagingTests(unittest.TestCase):
                 same,
                 "wxcloudrun/%s does not match %s; copy the repo file over it" % (rel, rel),
             )
+
+
+class LayoutVersionTests(unittest.TestCase):
+    """v1 stays on the frozen plate. v2 is the default depth-6 layout."""
+
+    @classmethod
+    def setUpClass(cls):
+        import arrow_wm as A
+        cls.A = A
+        cls.v1 = A.ArrowDesign(layout_version=1, depth=A.V1_DEPTH, verbose=False)
+        cls.v1_deep = A.ArrowDesign(layout_version=1, depth=A.MOD_DEPTH, verbose=False)
+        cls.v2 = A.ArrowDesign(verbose=False)
+
+    def test_v1_geometry_matches_golden_sha1(self):
+        A = self.A
+        self.assertEqual(A.layout_geometry_sha1(self.v1.cells), A.V1_GEOMETRY_SHA1)
+        self.assertEqual(
+            A.layout_geometry_sha1(self.v1.cells, with_window=False),
+            A.layout_geometry_sha1(self.v1_deep.cells, with_window=False))
+        self.assertEqual(self.v1.pair_perm, tuple(range(A.N_BITS)))
+        self.assertEqual(self.v1.pair_perm_id, A.PAIR_PERM_ID_V1)
+        self.assertNotEqual(self.v1.cells[0].half_win, self.v1_deep.cells[0].half_win)
+
+    def test_v2_cells_are_same_interval_and_deep_enough(self):
+        A = self.A
+        cells = self.v2.cells
+        self.assertEqual(len(cells), 140)
+        self.assertEqual(self.v2.layout_version, 2)
+        self.assertEqual(self.v2.depth, A.MOD_DEPTH)
+        self.assertEqual(self.v2.pair_perm, A.PAIR_PERM_V2)
+        self.assertEqual(sorted(self.v2.pair_perm), list(range(70)))
+        self.assertNotEqual(self.v2.pair_perm, tuple(range(70)))
+        min_clear = A.min_clearance_for_depth(A.MOD_DEPTH)
+        min_w = A.min_stroke_w_for_depth(A.MOD_DEPTH)
+        self.assertEqual(min_clear, 24)
+        self.assertEqual(min_w, 24.0)
+        letters = set()
+        for i in range(0, 140, 2):
+            a, b = cells[i], cells[i + 1]
+            self.assertEqual(a.track, b.track)
+            self.assertEqual(a.interval, b.interval)
+            h = min(a.height, b.height)
+            self.assertGreaterEqual(h, A.MIN_CELL_H)
+            self.assertLessEqual(abs(a.y_mid - b.y_mid), 1.2 * h + 1e-6)
+            self.assertGreaterEqual(min(a.clearance, b.clearance), min_clear)
+            self.assertGreaterEqual(min(a.width, b.width), min_w)
+            letters.add(a.letter)
+        self.assertGreaterEqual(len(letters), 4)
+        for g in range(10):
+            group = self.v2.pair_perm[7 * g:7 * g + 7]
+            tracks = {cells[2 * p].track for p in group}
+            names = {cells[2 * p].letter for p in group}
+            self.assertGreaterEqual(len(tracks), 4)
+            self.assertGreaterEqual(len(names), 4)
+
+    def test_v1_clean_roundtrip_and_inner_still_builds(self):
+        import arrow_decode as AD
+        import arrow_inner as I
+        digits = "13800138000"
+        plate = self.A.WatermarkEmbedder(self.v1, verbose=False).embed(digits)
+        self.assertEqual(plate["layout_version"], 1)
+        self.assertEqual(plate["depth"], self.A.V1_DEPTH)
+        self.assertEqual(plate["pair_perm_id"], self.A.PAIR_PERM_ID_V1)
+        session = AD.Decoder(carrier="edge", design=self.v1, use_ecc_refine=False)
+        result = session.decode(plate["plate"])
+        self.assertTrue(result.accepted, result.public_dict())
+        self.assertEqual(result.digits, digits)
+        # v2 must not be what decodes a v1 plate bit-exact; the smoke is that
+        # constructing the inner carrier on a v2 design does not raise.
+        inner = I.InnerCarrier(self.v2, verbose=False)
+        inner_plate = inner.embed(digits)
+        self.assertEqual(inner_plate["digits"], digits)
+        self.assertEqual(len(inner.cells), self.A.N_CELLS)
+
+    def test_clean_soft_n_is_order_one(self):
+        digits = "13800138000"
+        emb = self.A.WatermarkEmbedder(self.v2, verbose=False)
+        plate = emb.embed(digits)
+        dec = self.A.WatermarkDecoder(self.v2, use_ecc_refine=False, verbose=False)
+        res = dec.decode(plate["plate"])
+        self.assertEqual(res["digits"], digits)
+        soft = res["soft_n"]
+        self.assertGreater(float(abs(soft).mean()), 0.5)
+        self.assertLess(float(abs(soft).mean()), 1.6)
 
 
 _PNG_1X1 = base64.b64decode(

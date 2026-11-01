@@ -42,20 +42,24 @@ import numpy as np
 DEFAULT_CARRIER = "edge"
 CARRIERS = ("edge", "inner")
 
-# README / batch_decode: true codes sit at or above ~2.0, noise and unmarked
-# plates at or below ~1.4. The same 1.8 cut is used for edge and inner.
-# This is a watermark-present gate, not a digit-correct gate.
+# These cuts are z-scores of amplitude-normalized soft values (soft_n),
+# not pixel offsets and not the old 1.8 px modulation depth.
+# Edge decode divides the matched-filter differential by π·depth before
+# the gap/std margin is computed. A global scale does not move the z-score,
+# so the numeric cuts stay put when depth changes; per-bit depth_scale would.
+# v2@6 was checked against the same 1.8 / 1.0 cuts (see README ablation).
+# True codes still sit at or above ~2.0 and unmarked plates at or below ~1.4.
+# The 1.8 cut is a watermark-present gate, not a digit-correct gate.
 MARGIN_THRESHOLD = 1.8
 
-# Hard gate on the worst Hamming group (best-vs-2nd gap / std).
+# Hard gate on the worst Hamming group (best-vs-2nd gap / std of soft_n).
 # A single near-tie group can leave the mean above 1.8. Confidently wrong
 # groups (large gap on the wrong codeword) are not caught here; that needs
 # a payload CRC, which is out of scope.
-# Calibration at MOD_DEPTH=6 with the stability layout: 6 payloads x 4
-# attack levels, every correct accept had margin_min >= 1.24 and there was
-# no accept-and-wrong. Before that layout change, two wrong reads sat at
-# 0.17 and 0.32 while their means were 2.83 and 3.37. 1.0 sits between
-# those. Recalibrate with `arrow_wm.py --bench` if depth or layout changes.
+# The 1.0 cut was placed between correct accepts (margin_min >= 1.24 on the
+# pre-v2 ±6 px probe) and two wrong reads at 0.17 and 0.32. It is not a
+# pixel threshold. Recalibrate from a v2@6 --dump-pairs CSV if the layout
+# or the soft_n definition changes.
 MIN_GROUP_MARGIN = 1.0
 
 # --suspect: absolute z is not enough. The closest one-digit neighbor is
@@ -72,6 +76,14 @@ PAD_BITS = (0, 0, 0)
 # The production gate treats that same cut as a hard reject.
 CC_THRESHOLD = 0.85
 
+# README shooting note: below ~0.2× the plate width the edge wave is a
+# fraction of a camera pixel (±6 px at scale 0.077 is ±0.46 px). Extreme
+# sims in this repo sit around 0.7–0.9, so the cut does not touch that bench.
+# A frame under the cut is rejected even when registration cc is high.
+# It does not relax the margin gates, and a larger digital upscale of the
+# same pixels is a different image that still has to clear margin / pad.
+LOGO_SCALE_MIN = 0.20
+
 ImageLike = Union[np.ndarray, str, os.PathLike]
 
 REASON_TEXT = {
@@ -79,6 +91,7 @@ REASON_TEXT = {
     "low_group_margin": "单组裕度不足",
     "pad_mismatch": "补零不符",
     "low_cc": "配准 cc 不足",
+    "low_logo_scale": "画面中 Logo 过小",
     "invalid_payload": "码字越界",
     "unreadable": "读不到图像",
     "sync_failed": "同步失败",
@@ -352,6 +365,8 @@ def apply_gate(raw: Dict, *, carrier: str = DEFAULT_CARRIER,
             reasons.append("invalid_payload")
         if cc_threshold is not None and cc < cc_threshold:
             reasons.append("low_cc")
+        if logo_scale is not None and logo_scale < LOGO_SCALE_MIN:
+            reasons.append("low_logo_scale")
         if margin < margin_threshold:
             reasons.append("low_margin")
         if margin_min < min_group_margin:
@@ -427,6 +442,8 @@ class Decoder:
                  cc_threshold: Optional[float] = CC_THRESHOLD,
                  design=None,
                  depth: Optional[float] = None,
+                 layout_version: Optional[int] = None,
+                 window_pow: Optional[float] = None,
                  use_ecc_refine: bool = True,
                  verbose: bool = False):
         if carrier not in CARRIERS:
@@ -441,7 +458,22 @@ class Decoder:
             cc_threshold, self.use_ecc_refine)
 
         import arrow_wm as A
-        self.design = design if design is not None else A.ArrowDesign(verbose=verbose)
+        if design is not None:
+            self.design = design
+        elif carrier == "edge":
+            kw = {"verbose": verbose}
+            if layout_version is not None:
+                kw["layout_version"] = int(layout_version)
+            if depth is not None:
+                kw["depth"] = float(depth)
+            elif layout_version == 1:
+                # Old plates were printed at 1.8. v1@6 passes depth explicitly.
+                kw["depth"] = A.V1_DEPTH
+            if window_pow is not None:
+                kw["window_pow"] = float(window_pow)
+            self.design = A.ArrowDesign(**kw)
+        else:
+            self.design = A.ArrowDesign(verbose=verbose)
         if carrier == "edge":
             self._impl = A.WatermarkDecoder(
                 self.design, use_ecc_refine=self.use_ecc_refine, verbose=verbose)
@@ -485,6 +517,8 @@ def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
            return_debug: bool = False,
            design=None,
            depth: Optional[float] = None,
+           layout_version: Optional[int] = None,
+           window_pow: Optional[float] = None,
            use_ecc_refine: bool = True,
            verbose: bool = False) -> DecodeResult:
     """Decode one image. Carrier defaults to ``"edge"``; pass ``"inner"`` to opt in.
@@ -503,6 +537,8 @@ def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
         cc_threshold=cc_threshold,
         design=design,
         depth=depth,
+        layout_version=layout_version,
+        window_pow=window_pow,
         use_ecc_refine=use_ecc_refine,
         verbose=verbose,
     )
