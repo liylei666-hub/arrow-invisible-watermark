@@ -83,8 +83,10 @@ CC_THRESHOLD = 0.85
 # not touch that bench. The inner photo 17701234567 is logo_scale ≈ 0.160
 # with a correct readout; 0.15 accepts it and still rejects 0.077.
 # A frame under the cut is rejected even when registration cc is high.
-# It does not relax the margin gates, and a larger digital upscale of the
-# same pixels is a different image that still has to clear margin / pad.
+# It does not relax the margin gates. A 2×/4× interpolation of the same
+# pixels is not a larger logo: logo_scale stays on the pre-upscale grid
+# (homography scale divided by the detected integer factor), and margin /
+# pad still have to clear.
 LOGO_SCALE_MIN = 0.15
 
 ImageLike = Union[np.ndarray, str, os.PathLike]
@@ -94,7 +96,7 @@ REASON_TEXT = {
     "low_group_margin": "单组裕度不足",
     "pad_mismatch": "补零不符",
     "low_cc": "配准 cc 不足",
-    "low_logo_scale": "画面中 Logo 过小",
+    "low_logo_scale": "请靠近重拍",
     "invalid_payload": "码字越界",
     "unreadable": "读不到图像",
     "sync_failed": "同步失败",

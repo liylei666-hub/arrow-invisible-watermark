@@ -354,6 +354,127 @@ class RoundtripTests(unittest.TestCase):
         self.assertLess(via_fn.cc, AD.CC_THRESHOLD)
 
 
+class LogoScaleUpscaleTests(unittest.TestCase):
+    """Interpolation must not inflate logo_scale or slip past 0.15."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = AD.Decoder(carrier="inner")
+
+    def test_gates_and_low_logo_scale_copy(self):
+        import arrow_inner as I
+        self.assertEqual(AD.DEFAULT_CARRIER, "inner")
+        self.assertEqual(AD.LOGO_SCALE_MIN, 0.15)
+        self.assertEqual(AD.MIN_GROUP_MARGIN, 0.55)
+        self.assertEqual(AD.MARGIN_THRESHOLD, 1.8)
+        self.assertEqual(AD.CC_THRESHOLD, 0.85)
+        self.assertEqual(AD.PAD_BITS, (0, 0, 0))
+        self.assertEqual(I.DEPTH, 6.0)
+        self.assertEqual(AD.reason_text("low_logo_scale"), "请靠近重拍")
+        self.assertEqual(AD.REASON_TEXT["low_logo_scale"], "请靠近重拍")
+
+    def test_integer_upscale_keeps_logo_scale(self):
+        import cv2
+        import arrow_wm as A
+        plate = self.session._inner.embed("13800138000")["plate"]
+        native = self.session.decode(plate)
+        self.assertTrue(native.accepted, native.public_dict())
+        self.assertGreater(native.logo_scale, 0.5)
+        for factor, interp in (
+                (2, cv2.INTER_LINEAR), (4, cv2.INTER_LINEAR),
+                (2, cv2.INTER_CUBIC)):
+            up = cv2.resize(plate, None, fx=factor, fy=factor, interpolation=interp)
+            self.assertEqual(A.interpolation_upscale_factor(up), factor)
+            got = self.session.decode(up)
+            self.assertAlmostEqual(
+                got.logo_scale, native.logo_scale, delta=0.005,
+                msg=(factor, interp, got.logo_scale, native.logo_scale))
+
+    def test_tiny_logo_stays_rejected_after_upscale(self):
+        # Documented 0.077 case: a 2× interpolation would report ~0.154 and
+        # clear LOGO_SCALE_MIN if scale were measured on the enlarged grid.
+        import cv2
+        import arrow_wm as A
+        plate = self.session._inner.embed("13800138000")["plate"]
+        native = self.session.decode(plate)
+        target = 0.077
+        k = target / float(native.logo_scale)
+        tiny = cv2.resize(
+            plate,
+            (max(8, int(round(plate.shape[1] * k))),
+             max(8, int(round(plate.shape[0] * k)))),
+            interpolation=cv2.INTER_AREA)
+        self.assertEqual(A.interpolation_upscale_factor(tiny), 1)
+        base = self.session.decode(tiny)
+        self.assertFalse(base.accepted, base.public_dict())
+        self.assertIsNone(base.digits)
+        self.assertIn("low_logo_scale", base.reason)
+        self.assertAlmostEqual(base.logo_scale, target, delta=0.008)
+        self.assertLess(base.logo_scale, AD.LOGO_SCALE_MIN)
+        self.assertEqual(AD.reason_text(base.reason).split("，")[0], "请靠近重拍")
+        for factor in (2, 4):
+            up = cv2.resize(tiny, None, fx=factor, fy=factor,
+                            interpolation=cv2.INTER_LINEAR)
+            self.assertEqual(A.interpolation_upscale_factor(up), factor)
+            # Uncorrected homography scale would clear the gate.
+            self.assertGreaterEqual(base.logo_scale * factor, AD.LOGO_SCALE_MIN)
+            got = self.session.decode(up)
+            self.assertFalse(got.accepted, got.public_dict())
+            self.assertIsNone(got.digits)
+            self.assertIn("low_logo_scale", got.reason)
+            self.assertAlmostEqual(
+                got.logo_scale, base.logo_scale, delta=0.005,
+                msg=(factor, got.logo_scale, base.logo_scale))
+            self.assertLess(got.logo_scale, AD.LOGO_SCALE_MIN)
+
+    def test_sift_roi_crops_original_and_warps_once(self):
+        # Square card: plate#k rejects the aspect ratio. The box comes from
+        # coarse SIFT mapped back to full resolution, pad 0.2, and the
+        # decode samples the original frame once (H composed with the crop
+        # offset) instead of a resized crop.
+        import cv2
+        plate = self.session._inner.embed("13800138000")["plate"]
+        width = 420
+        height = max(8, int(round(plate.shape[0] * width / plate.shape[1])))
+        small = cv2.resize(plate, (width, height), interpolation=cv2.INTER_AREA)
+        side = int(round(max(small.shape) * 1.35))
+        card = np.full((side, side), 230, np.uint8)
+        y0 = (side - height) // 2
+        x0 = (side - width) // 2
+        card[y0:y0 + height, x0:x0 + width] = small
+        canvas = np.full((1600, 1800), 18, np.uint8)
+        oy = (canvas.shape[0] - side) // 2
+        ox = (canvas.shape[1] - side) // 2
+        canvas[oy:oy + side, ox:ox + side] = card
+
+        reg = self.session._impl._reg
+        box = reg.sift_roi_box(canvas, pad=0.2)
+        self.assertIsNotNone(box)
+        bx0, by0, bx1, by1 = box
+        self.assertLess((bx1 - bx0) * (by1 - by0), 0.85 * canvas.size)
+        self.assertGreaterEqual(ox + x0 + width // 2, bx0)
+        self.assertLess(ox + x0 + width // 2, bx1)
+        self.assertGreaterEqual(oy + y0 + height // 2, by0)
+        self.assertLess(oy + y0 + height // 2, by1)
+        # pad≈0.2 around the ink quad, still a crop of the original frame.
+        self.assertGreater(bx1 - bx0, width // 2)
+        self.assertGreater(by1 - by0, height // 2)
+
+        crop = np.ascontiguousarray(canvas[by0:by1, bx0:bx1])
+        via_source = self.session._impl._decode_gray(
+            crop, source=canvas, origin=(bx0, by0), upscale_factor=1)
+        self.assertTrue(via_source.get("ok"), via_source.get("reason"))
+        self.assertEqual(via_source.get("digits"), "13800138000")
+        self.assertGreaterEqual(via_source.get("cc", 0.0), AD.CC_THRESHOLD)
+        full = self.session.decode(canvas)
+        self.assertEqual(full.candidate_digits, "13800138000")
+        self.assertAlmostEqual(via_source["logo_scale"], full.logo_scale, delta=0.01)
+        # 2× interpolation of this same frame must not move logo_scale.
+        up = cv2.resize(canvas, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+        up_r = self.session.decode(up)
+        self.assertAlmostEqual(up_r.logo_scale, full.logo_scale, delta=0.01)
+
+
 class ServiceContractTests(unittest.TestCase):
     """HTTP contract around arrow_decode. Does not load a SIFT template."""
 

@@ -1657,6 +1657,129 @@ class CeramicCamSimulator:
 # 7. 模块 3：鲁棒透视矫正 + 亚像素盲解码器
 # ==============================================================================
 
+# OpenCV 整数倍 INTER_LINEAR / INTER_CUBIC 放大后，行和列会落进线性插值子空间。
+# 真照片不会。logo_scale 用单应在上传像素上的宽度，再除以这个倍数，
+# 避免「把小图插值放大」绕过 0.15。阈值卡在「干净插值」和「只是有点糊」之间：
+#   真 4× 线性 < 0.006，2× 大画幅在 4× 检验上约 0.020（不能当成 4×）；
+#   真 2× 线性 < 0.006，门控原图约 0.053，再高斯糊 σ≈1.2 仍约 0.013。
+# σ≈1.6 的重糊会碰到 2× 门，那种帧波形已经没了，不会因此被接受。
+_UPSCALE_SCORE_MAX = {4: 0.018, 2: 0.012}
+
+
+def _solve_tridiag(diag: np.ndarray, off: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Solve a symmetric tridiagonal system. ``off`` is the lower/upper diagonal."""
+    n = int(diag.shape[0])
+    d = diag.copy()
+    b = rhs.copy()
+    for i in range(n - 1):
+        if abs(d[i]) < 1e-12:
+            d[i] = 1e-12
+        w = off[i] / d[i]
+        d[i + 1] -= w * off[i]
+        b[i + 1] -= w * b[i]
+    x = np.zeros(n, np.float64)
+    x[-1] = b[-1] / d[-1]
+    for i in range(n - 2, -1, -1):
+        x[i] = (b[i] - off[i] * x[i + 1]) / d[i]
+    return x
+
+
+def _linear_resample_residual(row: np.ndarray, factor: int) -> Optional[float]:
+    """RMS residual / std after projecting one line onto OpenCV's linear resize.
+
+    ``cv2.resize(..., INTER_LINEAR)`` samples at
+    ``(i + 0.5) * (src/dst) - 0.5``. A line produced that way fits with a
+    residual around quantization; a native line does not. Returns None when
+    the line is too short or too flat to judge.
+    """
+    f = int(factor)
+    n = (int(row.shape[0]) // f) * f
+    if n < f * 16:
+        return None
+    src_n = n // f
+    y = np.ascontiguousarray(row[:n], dtype=np.float64)
+    sd = float(y.std())
+    if sd < 1.5:
+        return None
+    scale = src_n / float(n)
+    sx = (np.arange(n, dtype=np.float64) + 0.5) * scale - 0.5
+    sx = np.clip(sx, 0.0, src_n - 1.0)
+    i0 = np.floor(sx).astype(np.int32)
+    a = sx - i0
+    i1 = np.minimum(i0 + 1, src_n - 1)
+    w0 = 1.0 - a
+    w1 = a
+    same = i1 == i0
+    diag = np.zeros(src_n, np.float64)
+    off = np.zeros(max(src_n - 1, 0), np.float64)
+    rhs = np.zeros(src_n, np.float64)
+    np.add.at(diag, i0, w0 * w0)
+    np.add.at(rhs, i0, w0 * y)
+    if np.any(~same):
+        np.add.at(diag, i1[~same], (w1 * w1)[~same])
+        np.add.at(rhs, i1[~same], (w1 * y)[~same])
+        idx = i0[~same]
+        ok = idx < src_n - 1
+        if np.any(ok):
+            np.add.at(off, idx[ok], (w0 * w1)[~same][ok])
+    coef = _solve_tridiag(diag, off, rhs)
+    recon = w0 * coef[i0]
+    if np.any(~same):
+        recon = recon.copy()
+        recon[~same] += (w1 * coef[i1])[~same]
+    if np.any(same):
+        recon = np.array(recon, dtype=np.float64, copy=True)
+        recon[same] += (w1 * coef[i0])[same]
+    res = y - recon
+    return float(np.sqrt(np.mean(res * res)) / sd)
+
+
+def _upscale_axis_score(gray: np.ndarray, factor: int, horizontal: bool,
+                        n_lines: int = 24) -> float:
+    h, w = gray.shape[:2]
+    length = w if horizontal else h
+    other = h if horizontal else w
+    if length < factor * 16 or other < 8:
+        return 9.0
+    if horizontal:
+        stds = gray.std(axis=1)
+        idx = np.argsort(stds)[-min(n_lines, other):]
+        ratios = [_linear_resample_residual(gray[int(i)], factor) for i in idx]
+    else:
+        stds = gray.std(axis=0)
+        idx = np.argsort(stds)[-min(n_lines, other):]
+        ratios = [_linear_resample_residual(gray[:, int(i)], factor) for i in idx]
+    ratios = [r for r in ratios if r is not None]
+    if not ratios:
+        return 9.0
+    return float(np.median(ratios))
+
+
+def interpolation_upscale_factor(image: np.ndarray) -> int:
+    """Return 4, 2, or 1.
+
+    4 or 2 means the whole frame is an integer linear/cubic upsample.
+    Callers divide the homography's logo_scale by this so a client-side
+    interpolate-to-inflate does not move the 0.15 gate. A native photo,
+    and a real downscale such as the 0.077 tiny logo, returns 1.
+    """
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+    h, w = gray.shape[:2]
+    for factor, limit in ((4, _UPSCALE_SCORE_MAX[4]), (2, _UPSCALE_SCORE_MAX[2])):
+        if min(h, w) < factor * 32:
+            continue
+        rx = _upscale_axis_score(gray, factor, True)
+        ry = _upscale_axis_score(gray, factor, False)
+        if max(rx, ry) < limit:
+            return factor
+    return 1
+
+
 class WatermarkDecoder:
     """盲解码：字形自同步 → 单应矫正 → ECC 亚像素精配 → 法向亚像素积分 → 差分判决。
 
@@ -2116,14 +2239,77 @@ class WatermarkDecoder:
         return np.clip(cv2.addWeighted(warped, 1.0 + amt, blur, -amt, 0),
                        0, 255).astype(np.uint8)
 
-    def rectify(self, gray: np.ndarray) -> Dict:
-        """多起点矫正 + 收敛域抢救，取相关性最高的结果。"""
+    def sift_roi_box(self, gray: np.ndarray, pad: float = 0.2
+                     ) -> Optional[Tuple[int, int, int, int]]:
+        """Full-resolution crop box from a coarse SIFT homography.
+
+        SIFT itself may run on a long-side-1400 downsample inside
+        ``_sift_homography``; the homography is mapped back before this box
+        is measured. ``pad`` expands the projected logo quad (default 0.2)
+        and the box is clipped to ``gray``. Callers must crop at this
+        resolution and warp the original image once — not resize the crop.
+        """
+        Hm = self._sift_homography(gray)
+        if Hm is None:
+            return None
+        try:
+            Hi = np.linalg.inv(Hm.astype(np.float64))
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(Hi)):
+            return None
+        quad = cv2.perspectiveTransform(
+            self.ref_quad.reshape(1, -1, 2), Hi.astype(np.float32)).reshape(-1, 2)
+        if quad.shape != (4, 2) or not np.all(np.isfinite(quad)):
+            return None
+        x0, y0 = [float(v) for v in quad.min(axis=0)]
+        x1, y1 = [float(v) for v in quad.max(axis=0)]
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 8.0 or bh < 4.0:
+            return None
+        m = float(pad)
+        x0 -= m * bw
+        x1 += m * bw
+        y0 -= m * bh
+        y1 += m * bh
+        h, w = gray.shape[:2]
+        ix0 = max(0, int(np.floor(x0)))
+        iy0 = max(0, int(np.floor(y0)))
+        ix1 = min(int(w), int(np.ceil(x1)))
+        iy1 = min(int(h), int(np.ceil(y1)))
+        if ix1 - ix0 < 32 or iy1 - iy0 < 16:
+            return None
+        return ix0, iy0, ix1, iy1
+
+    def rectify(self, gray: np.ndarray, source: Optional[np.ndarray] = None,
+                origin: Tuple[float, float] = (0.0, 0.0),
+                upscale_factor: Optional[int] = None) -> Dict:
+        """多起点矫正 + 收敛域抢救，取相关性最高的结果。
+
+        ``source`` + ``origin``：在 1:1 裁切 ``gray`` 上估计单应，再按
+        H∘平移从 ``source``（上传原图）一次采样到版面坐标。不要先把裁切
+        放大再 warp。logo_scale 是这条单应在 ``source`` 像素里的尺度，
+        并除掉整幅整数插值倍数。
+        """
         Hs = self._find_transforms(gray)
         if not Hs:
             return {"ok": False, "reason": "sync_failed"}
+        ox, oy = float(origin[0]), float(origin[1])
+        use_source = source is not None
+        T = None
+        if use_source:
+            T = np.array([[1.0, 0.0, -ox],
+                          [0.0, 1.0, -oy],
+                          [0.0, 0.0, 1.0]], np.float64)
         best = None
         for k, Hm in enumerate(Hs):
-            warped = cv2.warpPerspective(gray, Hm, (CANVAS_W, CANVAS_H),
+            if use_source:
+                H_use = (Hm.astype(np.float64) @ T).astype(np.float32)
+                src = source
+            else:
+                H_use = Hm
+                src = gray
+            warped = cv2.warpPerspective(src, H_use, (CANVAS_W, CANVAS_H),
                                          flags=cv2.INTER_LINEAR,
                                          borderMode=cv2.BORDER_REPLICATE)
             ecc: Dict = {}
@@ -2145,13 +2331,21 @@ class WatermarkDecoder:
                             warped, ecc = base_warped, ecc
             cc = float(ecc.get("cc", 0.0))
             if best is None or cc > best["cc"]:
-                best = {"ok": True, "warped": warped, "H": Hm, "ecc": ecc,
+                best = {"ok": True, "warped": warped, "H": H_use, "ecc": ecc,
                         "cc": cc, "tries": k + 1}
             # 与解码入口的 CC_GATE=0.85 对齐：到门限即可停，不必追到 0.88
             if cc >= 0.85:
                 break
-        # 小尺寸实拍：边缘恢复后再交给宽度测量
+        # 小尺寸实拍：边缘恢复后再交给宽度测量。
+        # 尺度来自原图像素上的 H。整幅被 2×/4× 插值放大时除掉这个倍数，
+        # 否则 logo_scale 会跟着像素网格变大、绕过 0.15。
         sc = self._logo_scale(best["H"])
+        if upscale_factor is None:
+            scale_img = source if use_source else gray
+            upscale_factor = interpolation_upscale_factor(scale_img)
+        fac = int(upscale_factor or 1)
+        if fac > 1:
+            sc = sc / float(fac)
         best["logo_scale"] = sc
         best["warped"] = self._restore_edges(best["warped"], sc)
         best.pop("cc", None)
@@ -2460,8 +2654,9 @@ class WatermarkDecoder:
         cands = WatermarkDecoder._plate_candidates(gray, k=1)
         return cands[0] if cands else None
 
-    def _decode_gray(self, gray: np.ndarray, return_debug: bool = False) -> Dict:
-        r = self.rectify(gray)
+    def _decode_gray(self, gray: np.ndarray, return_debug: bool = False,
+                     upscale_factor: Optional[int] = None) -> Dict:
+        r = self.rectify(gray, upscale_factor=upscale_factor)
         if not r.get("ok"):
             return {"ok": False, "reason": r.get("reason", "rectify_failed"),
                     "digits": None, "bits": None, "ber": 1.0, "conf": 0.0,
@@ -2519,6 +2714,8 @@ class WatermarkDecoder:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
+        # 整幅一次判定。裁切候选沿用同一倍数，避免裁切块自己检不出放大。
+        upscale_factor = interpolation_upscale_factor(gray)
 
         # 择优规则：配准不可信（cc 过低）的解，置信度再高也不能信 ——
         # 实测：一条错误路径把整幅裁错，宽度测量全乱，conf 虚高到 0.12，
@@ -2554,7 +2751,7 @@ class WatermarkDecoder:
                     and best.get("mean_soft_n", 0.0) >= gate_soft_n)
 
         if not plate_first:
-            _consider(self._decode_gray(gray, return_debug), "full")
+            _consider(self._decode_gray(gray, return_debug, upscale_factor), "full")
             # 整幅已经解得又稳又准，就不必再花时间定位了
             if _good_enough(0.95, SOFT_N_PATH_GATE):
                 return best
@@ -2563,14 +2760,14 @@ class WatermarkDecoder:
             # 隔离区没比原图小多少 -> 说明整幅就是底版，没必要再解一次
             if cand.size / float(max(gray.size, 1)) >= 0.85:
                 continue
-            _consider(self._decode_gray(cand, return_debug), f"plate#{k}",
-                      isolated=True)
+            _consider(self._decode_gray(cand, return_debug, upscale_factor),
+                      f"plate#{k}", isolated=True)
             if _good_enough(CC_GATE, SOFT_N_PATH_GATE):
                 return best
 
         # 小卡片优先时，若卡片路径不够好，再补整幅兜底
         if plate_first:
-            _consider(self._decode_gray(gray, return_debug), "full")
+            _consider(self._decode_gray(gray, return_debug, upscale_factor), "full")
 
         if best is not None:
             return best
