@@ -14,6 +14,8 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
+
 import arrow_decode as AD
 
 
@@ -36,6 +38,7 @@ class GateTests(unittest.TestCase):
         }
         result = AD.apply_gate(raw, carrier="edge")
         self.assertFalse(result.accepted)
+        self.assertEqual(result.status, "rejected")
         self.assertIsNone(result.digits)
         self.assertEqual(result.candidate_digits, "13800138000")
         self.assertIn("low_margin", result.reason)
@@ -119,10 +122,106 @@ class GateTests(unittest.TestCase):
         }
         result = AD.apply_gate(raw)
         self.assertTrue(result.accepted)
+        self.assertEqual(result.status, "accepted")
         self.assertEqual(result.digits, "13800138000")
         self.assertEqual(result.reason, "")
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
+        self.assertEqual(result.margin, result.margin_mean)
+        self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
         self.assertGreaterEqual(result.cc, AD.CC_THRESHOLD)
+
+    def test_high_mean_low_group_margin_is_rejected(self):
+        # Nine confident groups keep the mean above 1.8. One near-tie group
+        # must still reject. The averaged margin is not a digit-correct gate.
+        import arrow_wm as A
+        cb = A.hamming_codebook()
+        soft = np.zeros(A.N_BITS, np.float64)
+        for g in range(10):
+            sgn = cb[0].astype(np.float64) * 2.0 - 1.0
+            amp = 0.04 if g == 4 else 2.5
+            soft[g * 7:(g + 1) * 7] = sgn * amp
+        ms = A.group_codeword_margins(soft)
+        self.assertGreaterEqual(float(ms.mean()), AD.MARGIN_THRESHOLD)
+        self.assertLess(float(ms.min()), AD.MIN_GROUP_MARGIN)
+        digits, _ = A.decode_payload_soft(soft)
+        raw = {
+            "ok": True, "digits": digits, "payload_valid": True,
+            "margin": float(ms.mean()), "margin_min": float(ms.min()),
+            "cc": 0.99, "mean_conf": 0.05, "logo_scale": 1.0,
+            "pad_bits": [0, 0, 0],
+        }
+        result = AD.apply_gate(raw)
+        self.assertFalse(result.accepted, result.public_dict())
+        self.assertEqual(result.status, "rejected")
+        self.assertIsNone(result.digits)
+        self.assertIn("low_group_margin", result.reason)
+        self.assertNotIn("low_margin", result.reason)
+        self.assertNotIn("pad_mismatch", result.reason)
+        self.assertGreaterEqual(result.margin_mean, AD.MARGIN_THRESHOLD)
+        self.assertLess(result.margin_min, result.min_group_margin_threshold)
+
+    def test_pad_mismatch_is_rejected(self):
+        # Group 0's first three data bits are the encoder's pad. They must
+        # be 000 even when every margin gate is comfortable.
+        import arrow_wm as A
+        data = [1, 0, 0, 0] + [0] * 36
+        code = np.array(A.hamming74_encode(data), np.float64)
+        soft = (code * 2.0 - 1.0) * 2.0
+        pad = A.group0_pad_bits(soft)
+        self.assertEqual(pad, (1, 0, 0))
+        ms = A.group_codeword_margins(soft)
+        digits, _ = A.decode_payload_soft(soft)
+        self.assertEqual(digits, "00000000000")
+        raw = {
+            "ok": True, "digits": digits, "payload_valid": True,
+            "margin": float(ms.mean()), "margin_min": float(ms.min()),
+            "cc": 0.99, "mean_conf": 0.05, "logo_scale": 1.0,
+            "pad_bits": list(pad),
+        }
+        result = AD.apply_gate(raw)
+        self.assertFalse(result.accepted, result.public_dict())
+        self.assertEqual(result.status, "rejected")
+        self.assertIsNone(result.digits)
+        self.assertEqual(result.candidate_digits, "00000000000")
+        self.assertIn("pad_mismatch", result.reason)
+        self.assertGreaterEqual(result.margin_mean, AD.MARGIN_THRESHOLD)
+        self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
+
+        ok_pad = AD.apply_gate(dict(raw, pad_bits=[0, 0, 0]))
+        self.assertTrue(ok_pad.accepted, ok_pad.public_dict())
+        self.assertEqual(ok_pad.status, "accepted")
+        self.assertNotIn("pad_mismatch", ok_pad.reason)
+
+    def test_suspect_gap_blocks_a_near_number(self):
+        # Ideal soft info aligned to the true number. A one-digit neighbor
+        # at Hamming distance 3 still has z above 4.5, so absolute z would
+        # call it strong evidence. The gap is negative, so the verdict is not.
+        import arrow_wm as A
+        true = "13800138000"
+        code = np.array(A.encode_payload(true), np.float64)
+        conf = (code * 2.0 - 1.0) * 0.08
+        own = AD.score_suspect(conf, true)
+        self.assertGreaterEqual(own.z, AD.SUSPECT_Z_STRONG)
+        self.assertGreaterEqual(own.gap, AD.SUSPECT_GAP_STRONG)
+        self.assertEqual(own.verdict, "包含（强证据）")
+
+        found = False
+        for i, ch in enumerate(true):
+            for digit in "0123456789":
+                if digit == ch:
+                    continue
+                suspect = true[:i] + digit + true[i + 1:]
+                scored = AD.score_suspect(conf, suspect)
+                if scored.z < AD.SUSPECT_Z_STRONG:
+                    continue
+                found = True
+                self.assertLess(scored.gap, 0.0, scored)
+                self.assertNotEqual(scored.verdict, "包含（强证据）")
+                self.assertNotEqual(scored.verdict, "疑似")
+                break
+            if found:
+                break
+        self.assertTrue(found, "expected a one-digit neighbor whose absolute z still clears 4.5")
 
 
 class RoundtripTests(unittest.TestCase):
@@ -136,9 +235,12 @@ class RoundtripTests(unittest.TestCase):
         plate = A.WatermarkEmbedder(self.edge.design, verbose=False).embed(self.digits)["plate"]
         result = self.edge.decode(plate)
         self.assertTrue(result.accepted, result.public_dict())
+        self.assertEqual(result.status, "accepted")
         self.assertEqual(result.digits, self.digits)
         self.assertEqual(result.carrier, "edge")
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
+        self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
+        self.assertEqual(result.raw.get("pad_bits"), [0, 0, 0])
         self.assertGreaterEqual(result.cc, AD.CC_THRESHOLD)
         self.assertEqual(result.cc_threshold, AD.CC_THRESHOLD)
         self.assertTrue(self.edge.use_ecc_refine)
@@ -174,8 +276,11 @@ class RoundtripTests(unittest.TestCase):
         result = session.decode(plate)
         self.assertEqual(result.carrier, "inner")
         self.assertTrue(result.accepted, result.public_dict())
+        self.assertEqual(result.status, "accepted")
         self.assertEqual(result.digits, self.digits)
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
+        self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
+        self.assertEqual(result.raw.get("pad_bits"), [0, 0, 0])
         self.assertGreaterEqual(result.cc, AD.CC_THRESHOLD)
 
     def test_no_ecc_clean_accepts_unmarked_rejects_on_margin(self):
@@ -197,6 +302,7 @@ class RoundtripTests(unittest.TestCase):
         self.assertEqual(result.carrier, "edge")
         self.assertLess(result.cc, AD.CC_THRESHOLD, result.public_dict())
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
+        self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
         self.assertIsNone(result.cc_threshold)
         self.assertNotIn("low_cc", result.reason)
 
@@ -315,31 +421,85 @@ class ServiceContractTests(unittest.TestCase):
         body = response.json()
         self.assertIn("接受".encode("utf-8"), response.content)
         for key in (
-            "accepted", "digits", "candidate_digits", "carrier", "margin", "cc",
-            "logo_scale", "mean_conf", "payload_valid", "ok", "reason",
-            "reason_text", "margin_threshold", "cc_threshold",
+            "accepted", "status", "digits", "carrier", "margin", "margin_mean",
+            "margin_min", "cc", "logo_scale", "mean_conf", "payload_valid",
+            "ok", "reason", "reason_text", "margin_threshold",
+            "min_group_margin_threshold", "cc_threshold",
         ):
             self.assertIn(key, body)
         self.assertNotIn("raw", body)
+        self.assertNotIn("candidate_digits", body)
         self.assertTrue(body["accepted"])
+        self.assertEqual(body["status"], "accepted")
         self.assertEqual(body["digits"], "13800138000")
         self.assertEqual(body["carrier"], "edge")
         self.assertEqual(body["reason"], "")
         self.assertEqual(body["reason_text"], "接受")
+        self.assertTrue(body["ok"])
         self.assertEqual(self.calls, [("edge", 1)])
 
-    def test_reject_hides_candidate_digits(self):
+    def test_reject_omits_candidate_and_ok_is_not_success(self):
         self.raw = {
             "ok": True, "digits": "13800138000", "payload_valid": True,
             "margin": 1.2, "cc": 0.97, "mean_conf": 0.04, "logo_scale": 1.0,
         }
-        body = self._post().json()
+        response = self._post()
+        body = response.json()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(body["accepted"])
+        self.assertEqual(body["status"], "rejected")
+        self.assertIsNone(body["digits"])
+        self.assertNotIn("candidate_digits", body)
+        self.assertTrue(body["ok"])
+        self.assertNotEqual(body["ok"], body["accepted"])
+        self.assertEqual(body["reason"], "low_margin")
+        self.assertEqual(body["reason_text"], "码字裕度不足")
+
+    def test_candidate_only_with_debug_and_token(self):
+        self.raw = {
+            "ok": True, "digits": "13800138000", "payload_valid": True,
+            "margin": 1.2, "cc": 0.97, "mean_conf": 0.04, "logo_scale": 1.0,
+        }
+        files = {"image": ("a.png", _PNG_1X1, "image/png")}
+        open_debug = self.client.post("/decode?debug=1", files=files)
+        self.assertEqual(open_debug.status_code, 200, open_debug.text)
+        self.assertNotIn("candidate_digits", open_debug.json())
+        self.assertEqual(open_debug.json()["status"], "rejected")
+
+        os.environ["DECODE_TOKEN"] = "devsecret"
+        denied = self.client.post(
+            "/decode?debug=1",
+            files=files,
+            headers={"X-Decode-Token": "nope"},
+        )
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.json()["status"], "error")
+        self.assertEqual(denied.json()["detail"], "unauthorized")
+        self.assertNotIn("candidate_digits", denied.json())
+
+        allowed = self.client.post(
+            "/decode?debug=1",
+            files=files,
+            headers={"X-Decode-Token": "devsecret"},
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        body = allowed.json()
+        self.assertEqual(body["status"], "rejected")
         self.assertFalse(body["accepted"])
         self.assertIsNone(body["digits"])
         self.assertEqual(body["candidate_digits"], "13800138000")
-        self.assertNotEqual(body["digits"], body["candidate_digits"])
-        self.assertEqual(body["reason"], "low_margin")
-        self.assertEqual(body["reason_text"], "码字裕度不足")
+        self.assertTrue(body["ok"])
+
+    def test_http_errors_use_status_error(self):
+        bad = self.client.post(
+            "/decode?carrier=both",
+            files={"image": ("a.png", _PNG_1X1, "image/png")},
+        )
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(bad.json()["status"], "error")
+        self.assertIn("detail", bad.json())
+        self.assertNotIn("accepted", bad.json())
+        self.assertNotIn("candidate_digits", bad.json())
 
     def test_query_carrier_beats_form_and_aliases_work(self):
         response = self.client.post(
@@ -383,7 +543,9 @@ class ServiceContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertFalse(body["accepted"])
+        self.assertEqual(body["status"], "rejected")
         self.assertIsNone(body["digits"])
+        self.assertNotIn("candidate_digits", body)
         self.assertEqual(body["reason"], "unreadable")
         self.assertEqual(body["reason_text"], "读不到图像")
         self.assertEqual(self.calls, [("edge", 0)])
@@ -415,7 +577,9 @@ class ServiceContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertTrue(body["accepted"])
+        self.assertEqual(body["status"], "accepted")
         self.assertEqual(body["digits"], "13800138000")
+        self.assertNotIn("candidate_digits", body)
         self.assertEqual(body["carrier"], "inner")
         self.assertEqual(self.calls, [("inner", 1)])
 

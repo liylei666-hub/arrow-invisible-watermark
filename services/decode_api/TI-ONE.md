@@ -87,7 +87,7 @@ curl -s -F "image=@samples/edge/ARROW_13800138000.png" \
 - 小程序 url 可以继续是  
   `https://ms-2w5g828w-100050884192.gw.ap-shanghai.ti.tencentcs.com/ms-2w5g828w/decode`  
   网关前缀不变，容器内仍是 `/decode`。
-- 换镜像之后，这条 URL 不再做原来的陶瓷解码。调用方要按 [小程序契约](../../docs/miniprogram-integration.md) 改字段：认 `accepted` + `digits`，拒绝时展示 `reason_text`，不要把 `candidate_digits` 当号码。
+- 换镜像之后，这条 URL 不再做原来的陶瓷解码。调用方要按 [小程序契约](../../docs/miniprogram-integration.md) 改字段：成功只认 `accepted === true`（或 `status === "accepted"`），拒绝时展示 `reason_text` 并标明结果不可信。不要用 `ok`，不要用 `candidate_digits`（默认响应里没有这个字段）。
 - 不要在这次替换里改其他服务的路由、镜像或资源。
 
 ## 平台侧和本服务各管一层
@@ -96,7 +96,7 @@ curl -s -F "image=@samples/edge/ARROW_13800138000.png" \
 |---|---|---|
 | 公网网关、服务 id、端口、探针 | TI-ONE 控制台，只针对这一条新服务（或上节那一个旧 id） | 密钥用控制台「服务鉴权」，头一般是 `Authorization` |
 | `POST /decode` 的可选共享密钥 | 该服务的环境变量 `DECODE_TOKEN` | 请求头 `X-Decode-Token`。未设置则不启用 |
-| 号码能不能信 | `arrow_decode` 的接受门 | HTTP 200 且 `accepted=false` 是一次正常的拒绝，不是网关故障 |
+| 号码能不能信 | `arrow_decode` 的接受门 | 只认 `accepted===true` / `status==="accepted"`。HTTP 200 且 `status=rejected` 是一次正常的拒绝，不是网关故障。400/401/413 的 `status=error` 才是请求错误 |
 
 控制台自带的「在线测试」偏向 JSON 请求体，不适合 multipart 图片。用上面的 `curl -F` 或小程序 `wx.uploadFile`（`name` 填 `image`）来验。
 

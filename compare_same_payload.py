@@ -99,7 +99,8 @@ def make(digits: str = DIGITS) -> None:
         ax.axis("off")
     fig.suptitle("实物尺寸观感：整幅宽 2.2 cm\n"
                  "本图按 330 px 渲染，约为实物尺寸的 4 倍，比实物更严苛\n"
-                 "波动幅度：边缘版 ±0.018 mm，内孔版 ±0.022 mm",
+                 f"波动幅度：边缘版 ±{A.MOD_DEPTH * 0.01:.3f} mm，"
+                 f"内孔版 ±{inner.depth * 0.01:.3f} mm",
                  fontsize=9.5, y=0.985)
     p2path = os.path.join(OUT, "15_physical_labeled.png")
     fig.savefig(p2path, dpi=150, facecolor="white")

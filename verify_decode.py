@@ -28,11 +28,13 @@ def quad_from_H(design, H):
         design.ref_quad.astype(np.float32).reshape(1, -1, 2), Hi).reshape(-1, 2)
 
 
-def render(img, res, out, digits=None):
+def render(img, res, out, digits=None, *, accepted=None, reason=""):
     """用**已经算好的**解码结果画核验图。
 
     抽成独立函数是为了让 batch_decode 复用同一个结果——
     之前批量出图会为每张图再完整解码一次，白跑一遍。
+
+    ``accepted is False`` 时标题写明拒绝，不把研究解码器的候选号当成结果。
     """
     design = A.ArrowDesign()
     shown = img
@@ -82,11 +84,21 @@ def render(img, res, out, digits=None):
         ax.axvline(k - 0.5, color="#999", lw=0.8, ls=":")
     ax.grid(axis="y", alpha=0.25)
     sub = f"红=与真值不符 {len(bad)} 个" if truth is not None else "绿=1  蓝=0"
+    if accepted is False:
+        why = AD.reason_text(reason) if reason else "拒绝"
+        decoded_line = f"拒绝（{why}），结果不可信"
+        headline = "实拍解码：拒绝（结果不可信）"
+    elif accepted is True:
+        decoded_line = f"解码 {res.get('digits')}"
+        headline = f"实拍解码：{res.get('digits')}"
+    else:
+        decoded_line = "解码结果未经过生产门"
+        headline = "实拍解码：结果未判定"
     ax.set_title(f"(c) 比特判决与置信度   {sub}   "
-                 f"解码 {res.get('digits')}   平均置信度 {res['mean_conf']:.4f}",
+                 f"{decoded_line}   平均置信度 {res['mean_conf']:.4f}",
                  fontsize=12)
 
-    fig.suptitle(f"实拍解码：{res.get('digits')}", fontsize=16, y=0.955)
+    fig.suptitle(headline, fontsize=16, y=0.955)
     fig.savefig(out, dpi=105, facecolor="white")
     plt.close(fig)
     return out
@@ -114,22 +126,22 @@ def main(argv=None) -> int:
         return 2
 
     if args.suspect:
-        conf = np.array(res["conf"], float)
-        cw = np.array(A.encode_payload(args.suspect))
-        sgn = (cw * 2 - 1).astype(float)
-        sc = float(np.dot(conf, sgn) / np.sqrt(len(cw)))
-        sd = float(np.std(conf)) or 1e-9
-        z = sc / sd
-        verdict = ("包含（强证据）" if z >= 4.5
-                   else ("疑似" if z >= 3.0 else "不包含"))
-        print(f"验真号码  {args.suspect}")
-        print(f"相关分    {sc:.4f}   z = {z:.1f} σ")
-        print(f"判定      {verdict}")
-        print("          （门限：真阳性实测 5.0–8.1σ，假阳性最高 3.8σ）")
+        if "conf" not in res:
+            print("验真失败：没有软信息")
+            return 2
+        scored = AD.score_suspect(np.array(res["conf"], float), args.suspect)
+        print(f"验真号码  {scored.suspect}")
+        print(f"相关分    {scored.score:.4f}   z = {scored.z:.1f} σ")
+        neighbor = scored.best_neighbor or "无"
+        print(f"最近邻号  {neighbor}   z = {scored.neighbor_z:.1f} σ")
+        print(f"间隙      {scored.gap:.2f} σ"
+              f"（强证据还需 ≥ {AD.SUSPECT_GAP_STRONG:g}，"
+              f"且 z ≥ {AD.SUSPECT_Z_STRONG:g}）")
+        print(f"判定      {scored.verdict}")
         blind = ("接受 " + result.digits) if result.accepted else (
-            f"拒绝（{AD.reason_text(result.reason)}），"
-            f"候选 {result.candidate_digits or '无'}（不可信）")
-        print(f"（盲解{blind}，裕度 {result.margin:.2f}，"
+            f"拒绝（{AD.reason_text(result.reason)}），结果不可信")
+        print(f"（盲解{blind}，裕度均值 {result.margin_mean:.2f}，"
+              f"最小 {result.margin_min:.2f}，"
               f"置信度 {result.mean_conf:.4f}，仅作参考）")
         return 0
 
@@ -144,7 +156,8 @@ def main(argv=None) -> int:
         print(f"候选      {cand}（不可信）")
         print(f"判定      拒绝（{AD.reason_text(result.reason)}）")
     scale = f"{result.logo_scale:.3f}" if result.logo_scale is not None else "—"
-    print(f"置信度    {result.mean_conf:.4f}   裕度 {result.margin:.2f}   "
+    print(f"置信度    {result.mean_conf:.4f}   "
+          f"裕度均值 {result.margin_mean:.2f}   最小 {result.margin_min:.2f}   "
           f"配准 cc = {result.cc:.3f}   logo_scale = {scale}")
     if args.digits:
         truth = np.array(A.encode_payload(args.digits))
@@ -158,7 +171,8 @@ def main(argv=None) -> int:
     out = args.out or os.path.join(
         "arrow_wm_out",
         f"decode_{os.path.splitext(os.path.basename(args.image))[0][:24]}.png")
-    render(img, res, out, args.digits)
+    render(img, res, out, args.digits,
+           accepted=result.accepted, reason=result.reason)
     print("核验图    ", out)
     return 0
 

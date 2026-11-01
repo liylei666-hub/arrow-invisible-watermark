@@ -1,8 +1,10 @@
 """HTTP wrapper around ``arrow_decode`` for the mini-program and TI-ONE.
 
 One :class:`arrow_decode.Decoder` is cached per carrier. Decode calls take a
-process-wide lock so OpenCV's matcher is not used re-entrantly. The accept
-gate itself is unchanged: this module only moves bytes in and JSON out.
+process-wide lock so OpenCV's matcher is not used re-entrantly. The accept gate lives in ``arrow_decode``. This module maps it to JSON:
+``status`` is ``accepted``, ``rejected``, or ``error``. ``ok`` is not a
+success bit. ``candidate_digits`` is omitted unless ``debug`` is set and
+``DECODE_TOKEN`` is configured (the request must already have matched it).
 
 Listen on ``0.0.0.0:$PORT`` (default **8501**). ``POST /decode`` keeps
 multipart, and also accepts JSON ``image_base64`` or a raw image body so
@@ -139,10 +141,30 @@ def decode_image(carrier: str, gray: np.ndarray) -> AD.DecodeResult:
         return get_decoder(carrier).decode(gray)
 
 
-def result_payload(result: AD.DecodeResult) -> dict:
-    """``DecodeResult.public_dict()`` plus Chinese ``reason_text``."""
+def candidate_debug_allowed(debug: bool) -> bool:
+    """Candidate digits leave the process only for an authenticated debug call.
+
+    ``DECODE_TOKEN`` unset means there is no valid token, so debug cannot
+    reveal a candidate. ``check_token`` has already rejected a mismatch.
+    """
+    if not debug:
+        return False
+    return bool(os.environ.get("DECODE_TOKEN", "").strip())
+
+
+def result_payload(result: AD.DecodeResult, *,
+                   include_candidate: bool = False) -> dict:
+    """``DecodeResult.public_dict()`` plus Chinese ``reason_text``.
+
+    ``candidate_digits`` is removed unless ``include_candidate``. Clients
+    must treat only ``accepted === true`` (equivalently ``status ==
+    "accepted"``) as a phone number. ``ok`` is the research decoder's sync
+    flag and is true on many rejects.
+    """
     body = result.public_dict()
     body["reason_text"] = AD.reason_text(result.reason)
+    if not include_candidate:
+        body.pop("candidate_digits", None)
     return body
 
 
@@ -248,17 +270,26 @@ def declared_length(request: Request) -> Optional[int]:
         return None
 
 
-async def finish_decode(carrier: str, data: bytes):
+async def finish_decode(carrier: str, data: bytes, *,
+                        include_candidate: bool = False):
     """Shared tail for every ``POST /decode`` body shape."""
     if not data:
         raise HTTPException(status_code=400, detail="empty image")
     ensure_upload_size(len(data))
     gray = bytes_to_gray(data)
-    result = await run_in_threadpool(decode_image, carrier, gray)
-    return UTF8JSONResponse(result_payload(result))
+    try:
+        result = await run_in_threadpool(decode_image, carrier, gray)
+    except HTTPException:
+        raise
+    except Exception:
+        return UTF8JSONResponse(
+            {"status": "error", "detail": "decode error"}, status_code=500)
+    return UTF8JSONResponse(
+        result_payload(result, include_candidate=include_candidate))
 
 
-async def decode_json_body(request: Request, query_carrier: Optional[str]):
+async def decode_json_body(request: Request, query_carrier: Optional[str], *,
+                           include_candidate: bool = False):
     """``{"image_base64": "...", "carrier": "edge"}``. Query carrier wins."""
     length = declared_length(request)
     if length is not None and length > _BASE64_CHAR_CAP + 4096:
@@ -279,16 +310,20 @@ async def decode_json_body(request: Request, query_carrier: Optional[str]):
         image = payload.get("image")
     if not isinstance(image, str) or not image.strip():
         raise HTTPException(status_code=400, detail="missing image_base64")
-    return await finish_decode(chosen, decode_base64_image(image))
+    return await finish_decode(
+        chosen, decode_base64_image(image), include_candidate=include_candidate)
 
 
-async def decode_raw_body(request: Request, query_carrier: Optional[str]):
+async def decode_raw_body(request: Request, query_carrier: Optional[str], *,
+                          include_candidate: bool = False):
     """Raw image bytes. ``carrier`` is the query param (default ``edge``)."""
     length = declared_length(request)
     if length is not None and length > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="image too large")
     data = await request.body()
-    return await finish_decode(carrier_from_value(query_carrier), data)
+    return await finish_decode(
+        carrier_from_value(query_carrier), data,
+        include_candidate=include_candidate)
 
 
 def select_upload(form) -> Optional[UploadFile]:
@@ -317,8 +352,19 @@ app = FastAPI(title="ARROW decode", version="1.0.0", lifespan=lifespan)
 app.add_middleware(GatewayPrefixMiddleware)
 
 
+@app.exception_handler(HTTPException)
+async def http_error(_request: Request, exc: HTTPException):
+    """Bad requests and auth failures are ``status=error``, not a decode."""
+    return UTF8JSONResponse(
+        {"status": "error", "detail": exc.detail},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
+
+
 @app.get("/health")
 def health():
+    # Liveness only. This "ok" is not a decode success.
     return {"status": "ok"}
 
 
@@ -326,14 +372,18 @@ def health():
 async def decode_endpoint(
     request: Request,
     carrier: Optional[str] = Query(default=None),
+    debug: bool = Query(default=False),
     x_decode_token: Optional[str] = Header(default=None, alias="X-Decode-Token"),
 ):
     check_token(x_decode_token)
+    include_candidate = candidate_debug_allowed(debug)
     kind = media_type(request.headers.get("content-type", ""))
     if kind == "application/json":
-        return await decode_json_body(request, carrier)
+        return await decode_json_body(
+            request, carrier, include_candidate=include_candidate)
     if kind in _RAW_MEDIA_TYPES:
-        return await decode_raw_body(request, carrier)
+        return await decode_raw_body(
+            request, carrier, include_candidate=include_candidate)
     if kind != "multipart/form-data":
         raise HTTPException(status_code=400, detail="expected multipart/form-data")
     try:
@@ -351,4 +401,5 @@ async def decode_endpoint(
         data = await upload.read()
     finally:
         await form.close()
-    return await finish_decode(chosen, data)
+    return await finish_decode(
+        chosen, data, include_candidate=include_candidate)

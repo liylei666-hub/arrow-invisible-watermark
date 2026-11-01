@@ -53,7 +53,15 @@ curl -s -F "image=@photo.jpg" -F "carrier=edge" \
   http://127.0.0.1:8501/decode
 ```
 
-成功时 JSON 里 `accepted` 为 `true`，`digits` 是 11 位号码，`reason_text` 为「接受」。拒绝时 `accepted` 为 `false`，`digits` 为 `null`，用 `reason` / `reason_text` 提示用户。`candidate_digits` 只是诊断读数，不能当号码显示。
+成功**只**认 `accepted === true`，等价于 `status === "accepted"`。这时 `digits` 是 11 位号码，`reason_text` 为「接受」。拒绝时 HTTP 仍是 200，`status` 为 `rejected`，`accepted` 为 `false`，`digits` 为 `null`，用 `reason` / `reason_text` 提示用户，文案按「结果不可信」处理。`ok` 不是成功位，无码图也可以是 `true`。
+
+`candidate_digits` 默认不返回。只有同时满足下面三条才出现，出现了也不能当号码：
+
+1. 查询参数 `debug=1`
+2. 服务设置了环境变量 `DECODE_TOKEN`
+3. 请求头 `X-Decode-Token` 与该值一致（否则是 401，`status` 为 `error`）
+
+请求本身不合法（400 / 401 / 413）时正文是 `{"status":"error","detail":"..."}`，不是一次解码拒绝。`GET /health` 的 `{"status":"ok"}` 只表示进程活着。
 
 `POST /decode` 还接受另外两种正文，返回和鉴权与 multipart 相同：
 

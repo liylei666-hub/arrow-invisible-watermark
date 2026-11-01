@@ -2,7 +2,7 @@
 
 与 `arrow_wm.py`（边缘宽度调制）的区别只有一处：信息写在哪里。
 
-    边缘版：调制字母**外轮廓**的笔画宽度 -> 外轮廓出现 ±1.8px 波浪
+    边缘版：调制字母**外轮廓**的笔画宽度 -> 外轮廓出现 ±MOD_DEPTH（默认 6px）波浪
     内孔版：外轮廓**一个像素都不动**，只调制 4 个内孔（O 内环、两个 R 字怀、
             A 上三角）的边界半径 -> 波浪被关进字母内部
 
@@ -291,11 +291,11 @@ class InnerDecoder:
                "payload_valid": digits is not None,
                "bits": bits, "feat": feat, "conf": conf_a,
                "mean_conf": float(np.mean(np.abs(conf_a))) * 0.5,
-               "margin": A.codeword_margin(conf_a),
                "corrected": n_chg, "n_corrected": n_chg,
                "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
                "logo_scale": float(r.get("logo_scale", 1.0)),
                "warped": r["warped"] if return_debug else None}
+        out.update(A.readout_qc(conf_a, bits, soft=True))
         if return_debug:
             out["H"] = r.get("H")
         return out
@@ -374,13 +374,19 @@ def run_bench(carrier: InnerCarrier, n: int = 20, seed: int = 6000,
               levels=("clean", "light", "moderate", "heavy", "extreme")) -> None:
     dec = InnerDecoder(carrier)
     sim = A.CeramicCamSimulator()
-    print("=" * 78)
-    print(f"  内孔载体压测  depth={carrier.depth:g}px  每组 {n} 样本")
-    print("=" * 78)
-    print(f"| {'档位':<12} | {'成功':>7} | {'BER':>8} | {'平均置信度':>10} | {'耗时':>7} |")
-    print("|" + "-" * 14 + "|" + "-" * 9 + "|" + "-" * 10 + "|" + "-" * 12 + "|" + "-" * 9 + "|")
+    import arrow_decode as AD
+    print("=" * 88)
+    print(f"  内孔载体压测（生产门）  depth={carrier.depth:g}px  每组 {n} 样本")
+    print("=" * 88)
+    print(f"| {'档位':<12} | {'研究正确':>8} | {'接受且对':>8} | {'接受且错':>8} | "
+          f"{'BER':>8} | {'耗时':>7} |")
+    print("|" + "-" * 14 + "|" + "-" * 10 + "|" + "-" * 10 + "|" + "-" * 10 + "|"
+          + "-" * 10 + "|" + "-" * 9 + "|")
+    cc_thr = AD.effective_cc_threshold(
+        AD.CC_THRESHOLD, bool(dec._reg.use_ecc_refine))
     for lv in levels:
-        oks, bers, confs, ts = 0, [], [], []
+        research_ok = accept_ok = accept_wrong = 0
+        bers, ts = [], []
         for sd in range(n):
             dg = "1%010d" % ((sd + seed) * 7919 % 10 ** 10)
             wm = carrier.embed(dg)
@@ -391,12 +397,16 @@ def run_bench(carrier: InnerCarrier, n: int = 20, seed: int = 6000,
             ts.append(__import__("time").time() - t0)
             b = np.array(r["bits"]) if r["ok"] else np.zeros(A.N_BITS, int)
             bers.append(float(np.mean(b != tb)) * 100.0)
-            oks += int(r.get("digits") == dg)
-            if r["ok"]:
-                confs.append(r["mean_conf"])
-        print(f"| {lv:<12} | {oks:>3d}/{n:<3d} | {np.mean(bers):>7.2f}% | "
-              f"{np.mean(confs) if confs else 0:>10.4f} | {np.mean(ts):>6.2f}s |")
-    print("=" * 78)
+            research_ok += int(r.get("digits") == dg)
+            gated = AD.apply_gate(r, carrier="inner", cc_threshold=cc_thr)
+            if gated.accepted and gated.digits == dg:
+                accept_ok += 1
+            elif gated.accepted:
+                accept_wrong += 1
+        print(f"| {lv:<12} | {research_ok:>3d}/{n:<3d} | {accept_ok:>3d}/{n:<3d} | "
+              f"{accept_wrong:>3d}/{n:<3d} | {np.mean(bers):>7.2f}% | "
+              f"{np.mean(ts):>6.2f}s |")
+    print("=" * 88)
 
 
 def export_plates(carrier: InnerCarrier, out_dir: str,
@@ -440,9 +450,8 @@ def main(argv=None) -> int:
     if args.decode:
         import time as _time
         import arrow_decode as AD
-        # 与边缘版对齐：接受与否看码字裕度 ≥1.8 且 cc ≥0.85，不再用 mean|conf|≥0.012。
-        # mean|conf| 在无码图上误报很高（见 README）。压测 run_bench 仍走 InnerDecoder，
-        # 不经过这道门，极限档成功率不在本入口里改。
+        # 与边缘版同一套生产门：裕度均值、单组最小裕度、补零、cc。
+        # 压测 run_bench 对 InnerDecoder 的结果再过这道门，并统计接受且错号。
         session = AD.Decoder(carrier="inner", design=carrier.design,
                              depth=args.depth, verbose=False)
         print("=" * 78)
@@ -458,7 +467,8 @@ def main(argv=None) -> int:
             dt = (_time.time() - t0) * 1000
             path_tag = r.raw.get("path", "?")
             scale = f"{r.logo_scale:.2f}" if r.logo_scale is not None else "—"
-            tail = (f"裕度 {r.margin:.2f}  cc {r.cc:.3f}  scale {scale}  "
+            tail = (f"裕度均值 {r.margin_mean:.2f}  最小 {r.margin_min:.2f}  "
+                    f"cc {r.cc:.3f}  scale {scale}  "
                     f"置信度 {r.mean_conf:.4f}  {dt:.0f}ms  path={path_tag}")
             if r.accepted:
                 print(f"  {_os.path.basename(path):<30} -> {r.digits}   {tail}  接受")

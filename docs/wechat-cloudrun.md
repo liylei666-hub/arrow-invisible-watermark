@@ -130,7 +130,7 @@ curl -s "https://<控制台给出的默认域名>/health"
 - 响应约 1 MB。本接口的 JSON 远小于这个上限。
 - `timeout` 最大 **15 秒**（15000 毫秒）。服务已经常驻（最小副本数 1）时，单次解码大约 0.5–2.5 秒，放得下。
 
-返回字段、`accepted` / `digits` / `reason_text` 的用法与 [miniprogram-integration.md](miniprogram-integration.md) 相同。`candidate_digits` 不能当号码展示。
+返回字段与 [miniprogram-integration.md](miniprogram-integration.md) 相同。成功只认 `accepted === true`（等价于 `status === "accepted"`）。不要用 `ok`。默认响应没有 `candidate_digits`。
 
 ### 照片：先压到 100 KiB
 
@@ -175,10 +175,11 @@ wx.cloud.callContainer({
   data: data,
   success(res) {
     const body = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
-    if (body.accepted && body.digits) {
+    // 成功只认 accepted===true。不要用 ok，不要用 candidate_digits。
+    if (body.accepted === true && body.status === "accepted" && body.digits) {
       // 展示 body.digits
     } else {
-      // 展示 body.reason_text，不要用 body.candidate_digits
+      // 展示 body.reason_text。拒绝时结果不可信
     }
   },
 });
@@ -205,10 +206,10 @@ wx.cloud.callContainer({
   },
   success(res) {
     const body = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
-    if (body.accepted && body.digits) {
+    if (body.accepted === true && body.status === "accepted" && body.digits) {
       // 展示 body.digits
     } else {
-      // 展示 body.reason_text
+      // 展示 body.reason_text。不要用 ok / candidate_digits
     }
   },
 });

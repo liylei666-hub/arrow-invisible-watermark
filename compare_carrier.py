@@ -93,7 +93,15 @@ def make(digits: str = "13800138000") -> None:
     ax.legend(loc="upper right", fontsize=11, ncol=3)
     ax.set_title(f"同一条外轮廓边的亚像素位置：原图与内孔版完全重合（峰峰值 0.00 px），"
                  f"边缘版起伏 {2 * A.MOD_DEPTH:.2f} px", fontsize=12)
-    ax.set_ylim(508.5, 516.0)
+    finite = []
+    for line in ax.get_lines():
+        ys = np.asarray(line.get_ydata(), np.float64)
+        finite.append(ys[np.isfinite(ys)])
+    if finite:
+        stacked = np.concatenate(finite)
+        mid = float(np.median(stacked))
+        half = max(4.0, float(A.MOD_DEPTH) + 2.0)
+        ax.set_ylim(mid - half, mid + half)
 
     # ---- 差值 ×12 ----
     for j, (img, tt) in enumerate(zip(imgs, titles)):

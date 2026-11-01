@@ -99,10 +99,14 @@ N_BITS: int = 70              # 编码后比特数 = 10 组 Hamming(7,4)
 N_CELLS: int = N_BITS * 2     # 每 bit 一个差分对 -> 140 个 Cell
 
 WINDOW_POW: float = 1.0       # 调制窗形状：1 = sin(πt)（斜率不连续），2 = sin²(πt)（C1 连续）
-MOD_DEPTH: float = 1.8        # 单侧边沿峰值偏移（px @ 底版尺度，约 0.018 mm）
-# 实测：1.5~3.0 在轻/中/重度下成功率相同，故取接近下限的 1.8 换取更平滑的边沿
+MOD_DEPTH: float = 6.0        # 单侧边沿峰值偏移（px @ 底版尺度，约 0.060 mm）
+# 与内孔载体 DEPTH 对齐。±0.060 mm 在 2.2 cm 的 logo 上仍低于约 0.1 mm 的
+# 视距分辨；打印 1200 dpi 时约 2.8 个墨点。早期 1.8 px 的已发表压测数字
+# 是旧工作点，不是当前默认。
 CELL_MARGIN: int = 10         # 解码测量窗相对笔画边缘的余量
-MIN_CLEARANCE: int = 20       # Cell 与邻近笔画的最小净空（保证测量窗不串扰）
+# 测量窗伸出笔画边缘 d+CELL_MARGIN，两侧同时调制时净空还要再让出 d。
+# 约束：净空 ≥ 2*MOD_DEPTH + CELL_MARGIN。6 px 时为 22。
+MIN_CLEARANCE: int = 22       # Cell 与邻近笔画的最小净空（保证测量窗不串扰）
 
 PAYLOAD_DIGITS: int = 11
 PAYLOAD_BITS: int = 37        # 10^11 - 1 < 2^37
@@ -309,29 +313,76 @@ def decode_payload_soft(soft: Sequence[float]) -> Tuple[str, int]:
     return bits_to_payload(data[3:]), n_chg
 
 
-def codeword_margin(soft: Sequence[float]) -> float:
-    """软判决的码字裕度——比 mean|conf| 可靠得多的"有无水印"判据。
+def group_codeword_margins(soft: Sequence[float]) -> np.ndarray:
+    """每组 Hamming 码字的 best-vs-2nd 间隙，再除以整段软信息的标准差。
 
-    对每个 7 bit 组，取 16 个合法码字里相关最高与次高之差，除以软信息
-    标准差，再对 10 组取平均。真码会在每组里"一个码字明显胜出"，噪声则
-    几乎打平。
-
-    实测（边缘载体）：
-        真码 clean 5.28 / heavy 4.35 / extreme 2.04
-        随机噪声 0.88~1.40，无码印版 0.96
-    注意 mean|conf| 分不开：噪声的 mean|conf| 能到 0.025，越过 0.020 门限，
-    而真码 heavy 才 0.030——两者只差 1.2 倍。裕度能拉开 3 倍以上。
+    返回长度 = 组数（70 bit 时为 10）。平均值是「有没有水印」的门；
+    最小值才会暴露「其中一组选得很勉强」。单组选错或打平时，平均值
+    仍可能被其余组抬过 1.8。
     """
     cb = hamming_codebook()
     sgn = (cb.astype(np.float64) * 2.0 - 1.0)
     soft = np.asarray(soft, np.float64).ravel()
+    n = int(soft.size) // 7
+    if n <= 0:
+        return np.zeros(0, np.float64)
     sd = float(np.std(soft)) or 1e-9
-    ms: List[float] = []
-    for g in range(len(soft) // 7):
+    ms = np.empty(n, np.float64)
+    for g in range(n):
         v = sgn @ soft[g * 7:(g + 1) * 7]
+        # partition 只保证这两位是最大的两个，彼此无序，必须再取 max-min。
         top = np.partition(v, len(v) - 2)[-2:]
-        ms.append(float(top[1] - top[0]) / sd)
-    return float(np.mean(ms)) if ms else 0.0
+        ms[g] = float(np.max(top) - np.min(top)) / sd
+    return ms
+
+
+def codeword_margin(soft: Sequence[float]) -> float:
+    """各组码字间隙的平均。真码明显高于噪声，但是读对/读错还要看最小值。
+
+    早期边缘载体（调制 ±1.8 px）实测：
+        真码 clean 5.28 / heavy 4.35 / extreme 2.04
+        随机噪声 0.88~1.40，无码印版 0.96
+    mean|conf| 分不开有码和无码；这个平均值可以。它盖不住单组选错。
+    """
+    ms = group_codeword_margins(soft)
+    return float(ms.mean()) if ms.size else 0.0
+
+
+def group0_pad_bits(soft: Sequence[float]) -> Optional[Tuple[int, int, int]]:
+    """第 0 组软判决的前 3 个数据位。编码时这 3 位被强制写成 000。"""
+    soft = np.asarray(soft, np.float64).ravel()
+    if soft.size < 7:
+        return None
+    cb = hamming_codebook()
+    sgn = (cb.astype(np.float64) * 2.0 - 1.0)
+    best = int(np.argmax(sgn @ soft[:7]))
+    code = cb[best]
+    return (int(code[2]), int(code[4]), int(code[5]))
+
+
+def pad_bits_from_hard(bits: Sequence[int]) -> Optional[Tuple[int, int, int]]:
+    """第 0 组硬判决的前 3 个数据位。软判决关闭时用这个核对补零。"""
+    raw = [int(b) & 1 for b in list(bits)[:7]]
+    if len(raw) < 7:
+        return None
+    data, _, _ = hamming74_decode(raw)
+    return (int(data[0]), int(data[1]), int(data[2]))
+
+
+def readout_qc(conf: Sequence[float], bits: Sequence[int], *,
+               soft: bool) -> Dict:
+    """生产门要用的裕度与补零。``margin`` 仍是各组间隙的平均。"""
+    ms = group_codeword_margins(conf)
+    mean = float(ms.mean()) if ms.size else 0.0
+    minimum = float(ms.min()) if ms.size else 0.0
+    pad = group0_pad_bits(conf) if soft else pad_bits_from_hard(bits)
+    return {
+        "margin": mean,
+        "margin_mean": mean,
+        "margin_min": minimum,
+        "group_margins": [float(x) for x in ms],
+        "pad_bits": None if pad is None else [int(b) for b in pad],
+    }
 
 
 def decode_payload(code_bits: Sequence[int]) -> Tuple[str, int, List[bool]]:
@@ -589,6 +640,7 @@ class Cell:
     slope: float
     width: float
     half_win: int
+    clearance: float = 0.0   # 该段与邻笔的最小净空（px）；0 表示旧布局没记录
 
     def center_at(self, y: float) -> float:
         return self.x_mid + self.slope * (y - self.y_mid)
@@ -743,7 +795,63 @@ class ArrowDesign:
         return self.render(self.mask4)
 
 
-def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: int = MOD_DEPTH,
+def _segment_stability(seg: Sequence[Tuple]) -> Tuple[float, float, float]:
+    """净空、|斜率|、纵向中点。净空和斜率来自布局阶段，不看具体号码。"""
+    ys = np.array([p[0] for p in seg], float)
+    cs = np.array([p[1] for p in seg], float)
+    slope = float(np.polyfit(ys, cs, 1)[0]) if len(ys) >= 2 else 0.0
+    clearance = float(min(p[3] for p in seg)) if seg and len(seg[0]) >= 4 else 0.0
+    return clearance, abs(slope), float(ys.mean()) if len(ys) else 0.0
+
+
+def _pair_fragility(seg_a: Sequence[Tuple], seg_b: Sequence[Tuple]) -> float:
+    """差分对有多容易错。数字来自 MOD_DEPTH=6 的小样本误码统计，见 README。
+
+    4 个号码 × moderate/heavy/extreme（12 次解码，840 bit）：
+      净空卡在 22px 门限上的位 BER 3.33%，净空 ≥30 的位约 1.7%；
+      |斜率| ≥ 0.6 的位 BER 5.0%，|斜率| < 0.2 的位 0.46%；
+      字高上沿 y∈[100,200) 的位 BER 4.2%，中下段约 1.6–1.8%。
+    有多余码元时优先丢掉这三类，而不是按轨迹顺序砍掉末尾。
+    """
+    cl_a, sl_a, y_a = _segment_stability(seg_a)
+    cl_b, sl_b, y_b = _segment_stability(seg_b)
+    clearance = min(cl_a, cl_b)
+    slope = max(sl_a, sl_b)
+    y_mid = 0.5 * (y_a + y_b)
+    cost = 0.0
+    if clearance < 30.0:
+        cost += 30.0 - clearance
+    if slope >= 0.45:
+        cost += (slope - 0.45) * 40.0
+    if y_mid < 200.0:
+        cost += (200.0 - y_mid) * 0.05
+    return cost
+
+
+def _select_stable_cells(cells_seg: List[Tuple], n_cells: int) -> List[Tuple]:
+    """从多余的码元里丢掉更脆的差分对，保留 ``n_cells`` 个，顺序仍按轨迹。"""
+    if len(cells_seg) <= n_cells:
+        return list(cells_seg[:n_cells])
+    if len(cells_seg) % 2 == 1:
+        cells_seg = list(cells_seg[:-1])
+    else:
+        cells_seg = list(cells_seg)
+    pairs = [(cells_seg[i], cells_seg[i + 1]) for i in range(0, len(cells_seg), 2)]
+    ranked = sorted(
+        range(len(pairs)),
+        key=lambda i: (-_pair_fragility(pairs[i][0][1], pairs[i][1][1]), i),
+    )
+    n_drop = len(pairs) - n_cells // 2
+    drop = set(ranked[:n_drop])
+    kept: List[Tuple] = []
+    for i, pair in enumerate(pairs):
+        if i in drop:
+            continue
+        kept.extend(pair)
+    return kept
+
+
+def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: float = MOD_DEPTH,
                  margin: int = CELL_MARGIN, min_clear: int = MIN_CLEARANCE,
                  min_track: int = 50) -> List[Cell]:
     """从二值字形掩膜自动推导码元布局。
@@ -810,7 +918,8 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: int = MOD_DEPTH,
             wv = e - s
             if not (0.85 * med <= wv <= 1.18 * med):
                 continue
-            ok.append((y, 0.5 * (s + e), float(wv)))
+            gap = float(min(cl, cr))
+            ok.append((y, 0.5 * (s + e), float(wv), gap))
         cur: List[Tuple[int, float, float]] = []
         for item in ok:
             if cur and item[0] == cur[-1][0] + 1:
@@ -831,9 +940,13 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: int = MOD_DEPTH,
     gmed = float(np.median(_allw)) if _allw else 0.0
 
     # ---- 3) 分配 Cell ----
+    # 最高的码元往往要靠「净空刚好 22px」的段才能凑满 140。那批段在
+    # ±6px 调制下误码大约是净空 ≥30px 段的两倍。这里把每个目标高度都
+    # 选出一组 140，取脆弱度最低、且码元不要短于 12px 的那组。
     chosen: List[List[Tuple[int, float, float]]] = []
     used_h = 0
-    for h_try in range(28, 6, -1):
+    best_cost = None
+    for h_try in range(28, 11, -1):
         cells_seg: List[Tuple[int, List[Tuple[int, float, float]]]] = []
         for ti in sorted(intervals):
             segs: List[List[Tuple[int, float, float]]] = []
@@ -858,10 +971,19 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: int = MOD_DEPTH,
                 segs = segs[:-1]
             for sg in segs:
                 cells_seg.append((ti, sg))
-        if len(cells_seg) >= n_cells:
-            chosen = cells_seg[:n_cells]
+        if len(cells_seg) < n_cells:
+            continue
+        picked = _select_stable_cells(cells_seg, n_cells)
+        heights = [len(sg) for _ti, sg in picked]
+        if not heights or min(heights) < 12:
+            continue
+        pairs = [(picked[i][1], picked[i + 1][1]) for i in range(0, len(picked), 2)]
+        cost = sum(_pair_fragility(a, b) for a, b in pairs)
+        # 同样脆弱时留更高的码元（h_try 从大往小扫，先到的更高）。
+        if best_cost is None or cost + 1e-6 < best_cost:
+            chosen = picked
             used_h = h_try
-            break
+            best_cost = cost
     if not chosen:
         # 兜底：容量不足时全部用上（仍保证偶数）
         cells_seg = []
@@ -887,8 +1009,10 @@ def build_layout(mask1: np.ndarray, n_cells: int = N_CELLS, d: int = MOD_DEPTH,
         x_mid = float(slope * y_mid + intercept)
         wv = float(np.median(ws))
         hw = int(round(wv * 0.5 + d + margin))
+        clearance = float(min(p[3] for p in seg)) if seg and len(seg[0]) >= 4 else 0.0
         out.append(Cell(idx=i, track=ti, y0=y0, y1=y1, x_mid=x_mid,
-                        y_mid=y_mid, slope=float(slope), width=wv, half_win=hw))
+                        y_mid=y_mid, slope=float(slope), width=wv, half_win=hw,
+                        clearance=clearance))
     return out
 
 
@@ -1625,7 +1749,7 @@ class WatermarkDecoder:
     @staticmethod
     def _restore_edges(warped: np.ndarray, scale: float) -> np.ndarray:
         """真实尺寸拍摄时 logo 往往只占画面一小块，矫正回 2200×600 等于强放大，
-        双线性会抹掉 ±1.8 px 的调制。轻度反锐化遮罩把边缘对比度拉回来。
+        双线性会抹掉亚像素调制（幅度见 MOD_DEPTH）。轻度反锐化遮罩把边缘对比度拉回来。
         scale≥0.45（接近半幅以上）时不处理，避免动干净印版的数值路径。
         """
         if scale >= 0.45:
@@ -1985,13 +2109,13 @@ class WatermarkDecoder:
         ecc.setdefault("cc", 0.0)          # ECC 被拒时也给出明确的 0
         out = {"ok": True, "digits": digits, "digits_hard": digits_hard,
                "payload_valid": digits is not None,
-               "margin": codeword_margin(conf),
                "bits": bits, "conf": conf,
                "widths": feat, "n_corrected": n_corr,
                "mean_conf": float(np.mean(np.abs(conf))),
                "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
                "logo_scale": float(r.get("logo_scale", 1.0)),
                "warped": warped if return_debug else None}
+        out.update(readout_qc(conf, bits, soft=self.use_soft_decode))
         if return_debug:
             out["H"] = r["H"]
         return out
@@ -2073,8 +2197,22 @@ class WatermarkDecoder:
             "n_corrected": 0, "path": "none",
         }
 
+def _production_gate(res: Dict, decoder: "WatermarkDecoder"):
+    """把研究解码器的一次结果送进 ``arrow_decode`` 的接受门。
+
+    ``--no-ecc`` 时研究解码器不算配准分，cc 保持 0，生产门因此跳过默认 cc 门，
+    裕度均值、单组最小裕度和补零一致性仍然生效。
+    """
+    import arrow_decode as AD
+    cc_thr = AD.effective_cc_threshold(
+        AD.CC_THRESHOLD, bool(getattr(decoder, "use_ecc_refine", True)))
+    if not isinstance(res, dict):
+        res = {"ok": False, "reason": "decode_failed", "digits": None}
+    return AD.apply_gate(res, carrier="edge", cc_threshold=cc_thr)
+
+
 class BenchmarkRunner:
-    """50 组随机号码 x 5 档扰动，统计 BER 与 11 位完整解码成功率。"""
+    """50 组随机号码 x 5 档扰动。统计走生产接受门，并单列接受且错号。"""
 
     def __init__(self, embedder: WatermarkEmbedder, sim: CeramicCamSimulator,
                  decoder: WatermarkDecoder, out_dir: str = OUT_DIR):
@@ -2094,7 +2232,8 @@ class BenchmarkRunner:
             digits_list.append(d)
 
         stats = {lv: {"n": 0, "bits": 0, "err": 0, "ok": 0, "conf": [],
-                      "fail": 0, "corr": 0} for lv in levels}
+                      "fail": 0, "corr": 0, "accept_correct": 0,
+                      "accept_wrong": 0, "rejected": 0} for lv in levels}
         t0 = time.time()
         total = n_payloads * len(levels)
         done = 0
@@ -2125,6 +2264,13 @@ class BenchmarkRunner:
                         st["err"] += N_BITS
                         st["fail"] += 1
                         st["conf"].append(0.0)
+                    gated = _production_gate(res, self.decoder)
+                    if gated.accepted and gated.digits == digits:
+                        st["accept_correct"] += 1
+                    elif gated.accepted:
+                        st["accept_wrong"] += 1
+                    else:
+                        st["rejected"] += 1
                     done += 1
                     if done % 25 == 0 or done == total:
                         el = time.time() - t0
@@ -2140,43 +2286,60 @@ class BenchmarkRunner:
                   "elapsed": elapsed, "stats": {}}
         for lv in levels:
             st = stats[lv]
+            n = max(1, st["n"])
             report["stats"][lv] = {
                 "n": st["n"],
                 "ber": st["err"] / max(1, st["bits"]),
-                "success": st["ok"] / max(1, st["n"]),
+                # success：生产门接受且号码正确。研究解码器「位数对上」另记。
+                "success": st["accept_correct"] / n,
+                "accept_and_wrong": st["accept_wrong"],
+                "accept_and_wrong_rate": st["accept_wrong"] / n,
+                "rejected": st["rejected"],
+                "research_success": st["ok"] / n,
                 "mean_conf": float(np.mean(st["conf"])) if st["conf"] else 0.0,
                 "mean_corrected": st["corr"] / max(1, st["n"]),
             }
+        report["gate"] = "arrow_decode"
         return report
 
     # ---------------- 终端表格 ----------------
     @staticmethod
     def print_report(report: Dict) -> None:
-        cols = [("扰动等级", 14), ("样本", 6), ("总比特", 8), ("错误比特", 10),
-                ("BER", 9), ("成功数", 8), ("成功率", 10), ("平均置信度", 13)]
+        cols = [("扰动等级", 14), ("样本", 6), ("BER", 9),
+                ("接受且对", 10), ("接受且错", 10), ("拒绝", 8),
+                ("研究正确", 10)]
         line = "+" + "+".join("-" * (c[1] + 2) for c in cols) + "+"
         print("\n" + "=" * 96)
-        print("  自动化压力测试报告  (BER = 比特错误率，成功率 = 11 位数字完全还原的比例)")
+        print("  压力测试（生产门）  接受且对 = accepted 且号码正确；"
+              "接受且错 = accepted 但号码不是真值")
         print("=" * 96)
         print(line)
         print("|" + "|".join(" " + _pad(c[0], c[1]) + " " for c in cols) + "|")
         print(line)
+        wrong = 0
         for lv in report["levels"]:
             s = report["stats"][lv]
+            n = max(1, s["n"])
+            n_ok = int(round(s["success"] * s["n"]))
+            n_wrong = int(s.get("accept_and_wrong", 0))
+            wrong += n_wrong
+            n_rej = int(s.get("rejected", s["n"] - n_ok - n_wrong))
+            n_research = int(round(s.get("research_success", 0.0) * s["n"]))
             row = [
                 f"{LEVEL_CN.get(lv, lv)} {lv}",
                 f"{s['n']}",
-                f"{s['n'] * N_BITS}",
-                f"{int(round(s['ber'] * s['n'] * N_BITS))}",
                 f"{s['ber'] * 100:.2f}%",
-                f"{int(round(s['success'] * s['n']))}",
-                f"{s['success'] * 100:.2f}%",
-                f"{s['mean_conf']:.4f}",
+                f"{n_ok}/{s['n']}",
+                f"{n_wrong}/{s['n']}",
+                f"{n_rej}",
+                f"{n_research}/{s['n']}",
             ]
             print("|" + "|".join(" " + _pad(v, cols[i][1], ">" if i > 0 else "<") + " "
                                  for i, v in enumerate(row)) + "|")
         print(line)
-        print(f"  总耗时 {report['elapsed']:.1f}s，平均 {report['elapsed'] / max(1, report['n_payloads'] * len(report['levels'])):.2f}s/次")
+        print(f"  接受且错号合计 {wrong}    "
+              f"总耗时 {report['elapsed']:.1f}s，"
+              f"平均 {report['elapsed'] / max(1, report['n_payloads'] * len(report['levels'])):.2f}s/次")
         print("=" * 96 + "\n")
 
 
@@ -2407,7 +2570,7 @@ def figure_benchmark(report: Dict, out_path: str) -> str:
     succ = [report["stats"][l]["success"] * 100 for l in lv]
     x = np.arange(len(lv))
     fig, ax1 = plt.subplots(figsize=(11, 5.6), facecolor="white")
-    ax1.bar(x - 0.2, succ, width=0.4, color="#2f6fb5", label="完整解码成功率 (%)")
+    ax1.bar(x - 0.2, succ, width=0.4, color="#2f6fb5", label="生产门接受且正确 (%)")
     ax1.set_ylim(0, 108)
     ax1.set_ylabel("成功率 (%)", fontsize=12)
     ax1.set_xticks(x)
@@ -2421,8 +2584,11 @@ def figure_benchmark(report: Dict, out_path: str) -> str:
     for xi, v in zip(x, ber):
         ax2.text(xi, v + 0.45, f"{v:.2f}%", ha="center", fontsize=10, color="#d03030",
                  bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85))
-    ax1.set_title(f"压力测试：{report['n_payloads']} 组随机号码 x {len(lv)} 档扰动",
-                  fontsize=14, pad=34)
+    wrong = sum(int(report["stats"][l].get("accept_and_wrong", 0)) for l in lv)
+    ax1.set_title(
+        f"压力测试（生产门接受且正确）：{report['n_payloads']} 组 x {len(lv)} 档"
+        f"    接受且错号 {wrong}",
+        fontsize=14, pad=34)
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax1.legend(h1 + h2, l1 + l2, loc="lower center", bbox_to_anchor=(0.5, 1.0),
@@ -2489,8 +2655,9 @@ def _print_decode_line(name: str, res, dt: float) -> None:
     """Print one production decode. Rejected rows never lead with a phone number."""
     import arrow_decode as AD
     scale = f"{res.logo_scale:.2f}" if res.logo_scale is not None else "—"
-    tail = (f"裕度 {res.margin:.2f}  cc {res.cc:.3f}  "
-            f"scale {scale}  置信度 {res.mean_conf:.4f}   {dt * 1000:.0f} ms")
+    tail = (f"裕度均值 {res.margin_mean:.2f}  最小 {res.margin_min:.2f}  "
+            f"cc {res.cc:.3f}  scale {scale}  置信度 {res.mean_conf:.4f}   "
+            f"{dt * 1000:.0f} ms")
     if res.accepted:
         print(f"  {name:<32} -> {res.digits}   {tail}  接受")
         return
@@ -2524,7 +2691,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.decode:
         # 生产门限走 arrow_decode。--no-ecc 关闭 ECC，研究解码器不计算 cc
         # （保持 0）。Decoder 因此跳过默认 cc≥0.85 门，只留裕度门；
-        # 默认路径两个门都开。压测仍直接调用 WatermarkDecoder.decode，不经过这道门。
+        # 默认路径生产门全开。压测在 BenchmarkRunner 里对同一次研究解码
+        # 再过 arrow_decode.apply_gate，并统计接受且错号。
         import arrow_decode as AD
         session = AD.Decoder(
             carrier="edge",
@@ -2534,7 +2702,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cc_note = "cc 门关闭（--no-ecc 不计算配准分）"
         else:
             cc_note = f"cc ≥ {AD.CC_THRESHOLD:g}"
-        print(f"  实拍照片解码（边缘载体）  裕度 ≥ {AD.MARGIN_THRESHOLD:g}  {cc_note}")
+        print(f"  实拍照片解码（边缘载体）  裕度均值 ≥ {AD.MARGIN_THRESHOLD:g}"
+              f"  单组最小 ≥ {AD.MIN_GROUP_MARGIN:g}  {cc_note}")
         print("=" * 74)
         for path in args.decode:
             img = imread_u(path)
