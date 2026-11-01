@@ -6,7 +6,11 @@ string once sync succeeds. This module is the integrator-facing wrapper:
 * default carrier is the edge watermark (``carrier="edge"``)
 * ``carrier="inner"`` selects the inner-hole carrier; its algorithm is unchanged
 * a hard gate sets ``accepted=False`` and ``digits=None`` unless the readout
-  clears both the codeword-margin threshold and the registration ``cc`` gate
+  clears the codeword-margin threshold and, when ECC refinement is on, the
+  registration ``cc`` gate. ``use_ecc_refine=False`` (``--no-ecc``) skips only
+  the cc gate: that path does not produce a registration score (``cc`` stays
+  0). The margin gate and the other accept rules still apply. Default remains
+  ECC on.
 
 Rejected calls still expose ``candidate_digits`` for diagnostics. That field
 is not a trusted phone number.
@@ -133,13 +137,31 @@ def _legal_payload(digits: Optional[str]) -> bool:
     return digits is not None and len(digits) == 11 and digits.isdigit()
 
 
+def effective_cc_threshold(cc_threshold: Optional[float],
+                           use_ecc_refine: bool) -> Optional[float]:
+    """Registration gate for one session, or None to skip it.
+
+    ``None`` always skips. With ECC refinement off the decoder does not
+    compute a registration score (``cc`` stays 0), so the default cut of
+    ``CC_THRESHOLD`` (0.85) is not applied. That is the ``--no-ecc`` rule.
+    Any other numeric threshold is kept. ECC on keeps the given threshold,
+    including the default 0.85.
+    """
+    if cc_threshold is not None:
+        cc_threshold = float(cc_threshold)
+    if not use_ecc_refine and (cc_threshold is None or cc_threshold == CC_THRESHOLD):
+        return None
+    return cc_threshold
+
+
 def apply_gate(raw: Dict, *, carrier: str = DEFAULT_CARRIER,
                margin_threshold: float = MARGIN_THRESHOLD,
                cc_threshold: Optional[float] = CC_THRESHOLD) -> DecodeResult:
     """Apply the production accept/reject gate to a research decoder dict.
 
-    ``cc_threshold=None`` skips the registration gate. That is only for the
-    research ``--no-ecc`` switch, which does not compute ``cc``.
+    ``cc_threshold=None`` skips the registration gate. ``Decoder`` passes
+    None for the default 0.85 cut when ECC refinement is off, because that
+    path does not compute ``cc``. The margin gate is unchanged.
     """
     if carrier not in CARRIERS:
         raise ValueError(f"carrier must be one of {CARRIERS}, got {carrier!r}")
@@ -217,6 +239,9 @@ class Decoder:
 
     Constructing the session loads the ARROW master and the SIFT template.
     Call :meth:`decode` once per image.
+
+    ``use_ecc_refine=False`` skips the default cc gate (registration ``cc``
+    stays 0). The margin gate and the other accept rules still apply.
     """
 
     def __init__(self, carrier: str = DEFAULT_CARRIER, *,
@@ -230,8 +255,11 @@ class Decoder:
             raise ValueError(f"carrier must be one of {CARRIERS}, got {carrier!r}")
         self.carrier = carrier
         self.margin_threshold = float(margin_threshold)
-        self.cc_threshold = None if cc_threshold is None else float(cc_threshold)
         self.use_ecc_refine = bool(use_ecc_refine)
+        # ECC off leaves cc at 0. Skip the default 0.85 gate; keep an
+        # explicit non-default threshold, and always keep the margin gate.
+        self.cc_threshold = effective_cc_threshold(
+            cc_threshold, self.use_ecc_refine)
 
         import arrow_wm as A
         self.design = design if design is not None else A.ArrowDesign(verbose=verbose)
@@ -282,6 +310,9 @@ def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
 
     On reject, ``accepted`` is False and ``digits`` is None. Do not promote
     ``candidate_digits`` to a phone number.
+
+    ``use_ecc_refine=False`` matches ``--no-ecc``: the default cc ≥ 0.85
+    check is skipped (``cc`` stays 0) and margin ≥ 1.8 still applies.
     """
     session = Decoder(
         carrier=carrier,

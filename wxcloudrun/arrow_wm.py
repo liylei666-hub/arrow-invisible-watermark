@@ -2522,13 +2522,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     do_bench = args.bench or args.all or (not args.demo and not args.bench)
 
     if args.decode:
-        # 生产门限走 arrow_decode。--no-ecc 时研究解码器不计算 cc，
-        # 因此只保留裕度门，cc 门关掉；默认路径两个门都开。
-        # 压测仍直接调用 WatermarkDecoder.decode，不经过这道门。
+        # 生产门限走 arrow_decode。--no-ecc 关闭 ECC，研究解码器不计算 cc
+        # （保持 0）。Decoder 因此跳过默认 cc≥0.85 门，只留裕度门；
+        # 默认路径两个门都开。压测仍直接调用 WatermarkDecoder.decode，不经过这道门。
         import arrow_decode as AD
         session = AD.Decoder(
             carrier="edge",
-            cc_threshold=None if args.no_ecc else AD.CC_THRESHOLD,
             use_ecc_refine=not args.no_ecc)
         print("=" * 74)
         if args.no_ecc:
