@@ -140,6 +140,20 @@ else:
 python ci_smoke.py
 ```
 
+**纯 JS 边缘解码（微信小程序，只覆盖已对齐的干净印版）**
+
+`js_decode/` 把边缘载体的生产解码收成两个 CommonJS 文件（`arrow_edge.js` + `layout.js`）：ES5、无 DOM、无 Node API、无 OpenCV / WASM。半高宽、差分、Hamming 软判决、裕度和接受门与 Python 相同。同步只认 **2200×600** 灰度画布（`gen_plate.py` 写出的那张）；`cc` 是 1/4 分辨率上与未加水印模板的归一化相关，**不是** `findTransformECC`。没有 SIFT、单应或 ECC。
+
+```bash
+python js_decode/compare_accuracy.py
+```
+
+需要本机有 Node。脚本用 `arrow_wm` 生成干净边缘印版（并经 `gen_plate.py` 走一遍 PNG），分别用 `arrow_decode` 和 JS 解码。
+
+12 个固定号码（含 `13800138000`）的干净印版：**Python 接受时 JS 也接受，号码 12/12 一致**。同一张未做 ECC 的印版上，JS 宽度特征与 Python `extract_widths` 的最大绝对差是 **3.0×10⁻⁷**。相对走完 ECC 的生产结果，裕度绝对差最大 **0.029**（均值 0.008；真码裕度约 5.2–10.6，门限 1.8），`cc` 绝对差最大 **0.0013**（两边都在 0.997 附近）。无码印版两边都因 `low_margin` 拒绝，`digits` 为 `null`（`candidate_digits` 只是诊断，不能当号码）。
+
+**不要把它接成拍照盲解。** 干净印版在画布内平移 15 px：Python 仍解出原号（裕度 5.29，cc 0.997），JS 拒绝（裕度 0.88，cc 0.81，`digits` 为 `null`）。实拍还要透视、缩放、滚转和 ECC 亚像素精配。照片若还没被矫正回 2200×600，继续走云端 Python。母版或布局变了之后，用 `python js_decode/export_layout.py` 重导 `layout.js`。
+
 **验真模式**（照片糊到盲解失败、但你知道嫌疑号码时）
 
 ```bash
@@ -173,6 +187,7 @@ python arrow_wm.py --bench -n 50 --seed 6000
 arrow_wm.py            边缘载体核心（嵌入 / 解码 / 仿真 / 压测）
 arrow_inner.py         内孔载体核心
 arrow_decode.py        生产解码 API（边缘默认，内孔可选，裕度 + cc 硬门）
+js_decode/             边缘载体的纯 JS 干净印版解码 + 与 Python 的对照脚本
 gen_plate.py           生成印版（单张 / 批量 / 两种载体）
 verify_decode.py       单张解码 + 核验图 + 验真模式
 batch_decode.py        批量解码（扫目录 / CSV / 批量出图）
@@ -196,6 +211,7 @@ samples/               样张与插图
 - **极限档 74%** 是物理信噪比的边界。其中约一半失败来自配准、一半来自信号不足；后者受限于调制幅度，加大就破坏隐蔽性。
 - **拍摄建议**：距离 8–15 cm，让 Logo 占画面 1/3 以上，避开强反光（最主要的干扰源）。倾斜 30° 以内能自动矫正。低于原图 0.2 倍缩放时信号会不足。
 - **研究解码器对无码图仍会吐出一个号码**——判决器总要给出 0/1。生产入口 `arrow_decode.decode` 用硬门把它拒掉：码字裕度低于 1.8，或配准 cc 低于 0.85，或码字不是合法 11 位号码时，`accepted=False` 且 `digits=None`。真码裕度 ≥ 2.0，噪声/无码 ≤ 1.4。不要用 `mean|conf|` 做有无水印的判据（误报可达 40% 以上）；内孔命令行以前的 0.012 置信度提示已改成与边缘相同的裕度 + cc 门。
+- **`js_decode/` 只解已经对齐的 2200×600 干净印版。** 平移 15 px 就会和 Python 拉开（Python 仍接受，JS 拒绝）。手机照片的同步和 ECC 不在这个模块里。
 
 ## 理论出处
 
