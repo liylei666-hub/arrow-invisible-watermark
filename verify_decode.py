@@ -15,6 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+import arrow_decode as AD
 import arrow_wm as A
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
@@ -105,11 +106,11 @@ def main(argv=None) -> int:
         print("读不到文件：", args.image)
         return 1
 
-    design = A.ArrowDesign()
-    dec = A.WatermarkDecoder(design)
-    res = dec.decode(img, return_debug=True)
-    if not res.get("ok"):
-        print("解码失败：", res.get("reason"))
+    session = AD.Decoder(carrier="edge")
+    result = session.decode(img, return_debug=True)
+    res = result.raw
+    if not result.ok:
+        print("解码失败：", AD.reason_text(result.reason))
         return 2
 
     if args.suspect:
@@ -125,21 +126,34 @@ def main(argv=None) -> int:
         print(f"相关分    {sc:.4f}   z = {z:.1f} σ")
         print(f"判定      {verdict}")
         print("          （门限：真阳性实测 5.0–8.1σ，假阳性最高 3.8σ）")
-        print(f"（盲解结果 {res['digits']}，置信度 {res['mean_conf']:.4f}，仅作参考）")
+        blind = ("接受 " + result.digits) if result.accepted else (
+            f"拒绝（{AD.reason_text(result.reason)}），"
+            f"候选 {result.candidate_digits or '无'}（不可信）")
+        print(f"（盲解{blind}，裕度 {result.margin:.2f}，"
+              f"置信度 {result.mean_conf:.4f}，仅作参考）")
         return 0
 
-    shown_digits = (res["digits"] if res.get("payload_valid", True)
-                    else "码字越界（非有效号码）")
     print(f"文件      {os.path.basename(args.image)}")
     print(f"尺寸      {img.shape[1]}×{img.shape[0]} px")
-    print(f"解码号码  {shown_digits}")
-    print(f"置信度    {res['mean_conf']:.4f}   配准 cc = {float(res.get('cc', 0.0)):.3f}")
+    if result.accepted:
+        print(f"解码号码  {result.digits}")
+        print(f"判定      接受")
+    else:
+        cand = result.candidate_digits or "无"
+        print(f"解码号码  （拒绝，不作为可信号码）")
+        print(f"候选      {cand}（不可信）")
+        print(f"判定      拒绝（{AD.reason_text(result.reason)}）")
+    scale = f"{result.logo_scale:.3f}" if result.logo_scale is not None else "—"
+    print(f"置信度    {result.mean_conf:.4f}   裕度 {result.margin:.2f}   "
+          f"配准 cc = {result.cc:.3f}   logo_scale = {scale}")
     if args.digits:
         truth = np.array(A.encode_payload(args.digits))
         bad = np.where(np.array(res["bits"]) != truth)[0]
         print(f"逐比特    错 {len(bad)}/{len(truth)}"
               + (f"  位置 {bad.tolist()}" if len(bad) else "  （完美）"))
-        print(f"号码比对  {'一致' if res['digits'] == args.digits else '不一致！'}")
+        got = result.digits if result.accepted else result.candidate_digits
+        note = "" if result.accepted else "（候选，未接受）"
+        print(f"号码比对  {'一致' if got == args.digits else '不一致！'}{note}")
 
     out = args.out or os.path.join(
         "arrow_wm_out",

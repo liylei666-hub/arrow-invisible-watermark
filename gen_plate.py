@@ -23,6 +23,7 @@ import time
 
 import numpy as np
 
+import arrow_decode as AD
 import arrow_wm as A
 
 CARRIERS = ("edge", "inner")
@@ -73,11 +74,12 @@ def main(argv=None) -> int:
 
     design = A.ArrowDesign()
     emb = {"edge": A.WatermarkEmbedder(design, verbose=False)}
-    dec = {"edge": A.WatermarkDecoder(design)}
+    # 自检走生产门：号码对得上且 accepted 才算 OK。干净印版应同时过裕度与 cc。
+    dec = {"edge": AD.Decoder(carrier="edge", design=design)}
     if "inner" in carriers:
         import arrow_inner as I
         emb["inner"] = I.InnerCarrier(design)
-        dec["inner"] = I.InnerDecoder(emb["inner"])
+        dec["inner"] = AD.Decoder(carrier="inner", design=design)
 
     os.makedirs(args.outdir, exist_ok=True)
     print(f"{'载体':<6}{'号码':<14}{'文件':<34}{'自检':>6}{'置信度':>10}{'耗时':>8}")
@@ -102,10 +104,10 @@ def main(argv=None) -> int:
                 mark, conf = "—", 0.0
             else:
                 r = dec[c].decode(wm["plate"])
-                ok = r.get("digits") == dg
+                ok = bool(r.accepted and r.digits == dg)
                 n_ok += int(ok)
                 mark = "OK" if ok else "FAIL"
-                conf = r.get("mean_conf", 0.0)
+                conf = r.mean_conf
             print(f"{c:<6}{dg:<14}{os.path.basename(path):<34}"
                   f"{mark:>6}{conf:>10.4f}{dt:>7.0f}ms")
     print("-" * 80)

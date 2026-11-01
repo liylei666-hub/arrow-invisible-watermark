@@ -22,8 +22,7 @@ import os
 import sys
 import time
 
-import numpy as np
-
+import arrow_decode as AD
 import arrow_wm as A
 
 EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
@@ -52,7 +51,9 @@ def main(argv=None) -> int:
     ap.add_argument("--csv", default=None, help="把结果写成 CSV")
     ap.add_argument("--save-figs", action="store_true", help="逐张输出核验图")
     ap.add_argument("--thresh", type=float, default=None,
-                    help="码字裕度门限（边缘默认 1.8；噪声/无码实测 ≤1.4）")
+                    help="码字裕度门限（默认 1.8，边缘与内孔相同；噪声/无码实测 ≤1.4）")
+    ap.add_argument("--cc-thresh", type=float, default=None,
+                    help="配准 cc 门限（默认 0.85，与解码器内部择优门相同）")
     args = ap.parse_args(argv)
 
     files = collect(args.paths)
@@ -61,18 +62,13 @@ def main(argv=None) -> int:
         return 1
 
     design = A.ArrowDesign()
-    if args.carrier == "edge":
-        dec = A.WatermarkDecoder(design)
-        default_thr = 1.8
-    else:
-        import arrow_inner as I
-        dec = I.InnerDecoder(I.InnerCarrier(design))
-        # 内孔版现已返回码字裕度（与边缘版同一口径）。
-        # 实测：真码 ≥3.3（含 0.13× 小图），无码 ≈0.4，噪声 ≤1.2；门限取 1.8。
-        default_thr = 1.8
-    thr = args.thresh if args.thresh is not None else default_thr
+    margin_thr = AD.MARGIN_THRESHOLD if args.thresh is None else args.thresh
+    cc_thr = AD.CC_THRESHOLD if args.cc_thresh is None else args.cc_thresh
+    dec = AD.Decoder(carrier=args.carrier, design=design,
+                     margin_threshold=margin_thr, cc_threshold=cc_thr)
 
-    print(f"载体 {args.carrier}   共 {len(files)} 张   裕度门限 {thr:g}")
+    print(f"载体 {args.carrier}   共 {len(files)} 张   "
+          f"裕度门限 {margin_thr:g}   cc 门限 {cc_thr:g}")
     print("=" * 92)
     print(f"{'文件':<40}{'解码号码':<14}{'裕度':>9}{'cc':>8}{'耗时':>8}  判定")
     print("-" * 92)
@@ -90,25 +86,24 @@ def main(argv=None) -> int:
         # 要出核验图时必须带 debug 信息（矫正图与单应），否则画不出来
         r = dec.decode(img, return_debug=bool(args.save_figs))
         dt = (time.time() - t0) * 1000
-        if not r.get("ok"):
-            print(f"{name:<40}{'解码失败':<14}{'':>9}{'':>8}{dt:>7.0f}ms  {r.get('reason')}")
-            rows.append([name, "", "", "", f"{dt:.0f}", r.get("reason", "fail")])
+        if not r.ok:
+            why = AD.reason_text(r.reason)
+            print(f"{name:<40}{'解码失败':<14}{'':>9}{'':>8}{dt:>7.0f}ms  {why}")
+            rows.append([name, "", "", "", f"{dt:.0f}", why])
             continue
-        conf = r["mean_conf"]
-        mg = float(r.get("margin", 0.0))
-        cc = r["ecc"].get("cc", 0.0) if isinstance(r.get("ecc"), dict) else 0.0
-        ok = mg >= thr
-        n_ok += int(ok)
-        tag = "有码" if ok else "裕度不足"
-        shown = r["digits"] if r.get("payload_valid", True) else "码字越界"
-        print(f"{name:<40}{shown:<14}{mg:>9.2f}{cc:>8.3f}{dt:>7.0f}ms  {tag}")
-        rows.append([name, shown, f"{mg:.2f}", f"{cc:.3f}", f"{dt:.0f}", tag])
+        tag = "有码" if r.accepted else AD.reason_text(r.reason)
+        # 号码列只写接受结果。拒绝时留空，避免把候选号码当成可信结果写进 CSV。
+        shown = r.digits if r.accepted else ""
+        n_ok += int(r.accepted)
+        print(f"{name:<40}{(shown or '拒绝'):<14}{r.margin:>9.2f}{r.cc:>8.3f}"
+              f"{dt:>7.0f}ms  {tag}")
+        rows.append([name, shown, f"{r.margin:.2f}", f"{r.cc:.3f}", f"{dt:.0f}", tag])
 
-        if args.save_figs:
+        if args.save_figs and r.raw.get("bits") is not None:
             try:
                 import verify_decode as V
                 # 复用上面已经算好的结果，不再重复解码一遍
-                V.render(img, r, os.path.join(
+                V.render(img, r.raw, os.path.join(
                     os.path.dirname(path) or ".",
                     "核验_" + os.path.splitext(name)[0] + ".png"))
             except Exception as e:      # 出图失败不影响解码结果

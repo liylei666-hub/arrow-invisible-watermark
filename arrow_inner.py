@@ -436,9 +436,14 @@ def main(argv=None) -> int:
         export_plates(carrier, args.export)
     if args.decode:
         import time as _time
-        dec = InnerDecoder(carrier)
+        import arrow_decode as AD
+        # 与边缘版对齐：接受与否看码字裕度 ≥1.8 且 cc ≥0.85，不再用 mean|conf|≥0.012。
+        # mean|conf| 在无码图上误报很高（见 README）。压测 run_bench 仍走 InnerDecoder，
+        # 不经过这道门，极限档成功率不在本入口里改。
+        session = AD.Decoder(carrier="inner", design=carrier.design,
+                             depth=args.depth, verbose=False)
         print("=" * 78)
-        print("  实拍照片解码（内孔载体）")
+        print("  实拍照片解码（内孔载体，生产门限）")
         print("=" * 78)
         for path in args.decode:
             img = A.imread_u(path)
@@ -446,21 +451,23 @@ def main(argv=None) -> int:
                 print(f"  {_os.path.basename(path):<30} -> 读不到文件")
                 continue
             t0 = _time.time()
-            r = dec.decode(img)
+            r = session.decode(img)
             dt = (_time.time() - t0) * 1000
-            if r["ok"]:
-                mg = float(r.get("margin", 0.0))
-                cc = float(r.get("cc", 0.0))
-                # 内孔版无码/噪声裕度更低；门限取 0.012 与历史 conf 口径一致，
-                # 同时打印码字裕度方便与边缘版对照。
-                tag = "" if r["mean_conf"] >= 0.012 else "   [置信度低，可能未嵌入水印]"
-                shown = r["digits"] if r.get("payload_valid", True) else "码字越界"
-                print(f"  {_os.path.basename(path):<30} -> {shown}   "
-                      f"裕度 {mg:.2f}  cc {cc:.3f}  置信度 {r['mean_conf']:.4f}  "
-                      f"{dt:.0f}ms  path={r.get('path', '?')}{tag}")
+            path_tag = r.raw.get("path", "?")
+            scale = f"{r.logo_scale:.2f}" if r.logo_scale is not None else "—"
+            tail = (f"裕度 {r.margin:.2f}  cc {r.cc:.3f}  scale {scale}  "
+                    f"置信度 {r.mean_conf:.4f}  {dt:.0f}ms  path={path_tag}")
+            if r.accepted:
+                print(f"  {_os.path.basename(path):<30} -> {r.digits}   {tail}  接受")
             else:
-                print(f"  {_os.path.basename(path):<30} -> 解码失败（{r['reason']}）  "
-                      f"{dt:.0f}ms")
+                if r.candidate_digits:
+                    extra = f"候选 {r.candidate_digits}（不可信）"
+                elif r.ok:
+                    extra = "候选 码字越界（不可信）"
+                else:
+                    extra = "无候选"
+                print(f"  {_os.path.basename(path):<30} -> 拒绝（{AD.reason_text(r.reason)}）  "
+                      f"{extra}   {tail}")
         print("=" * 78)
     return 0
 

@@ -66,8 +66,10 @@
 ## 快速开始
 
 ```bash
-pip install numpy opencv-python matplotlib pillow
+pip install -r requirements.txt
 ```
+
+`requirements.txt` 使用 `opencv-python-headless`（CI 与服务器无图形界面时用这个）。本机若已装带 GUI 的 `opencv-python`，不必再装 headless，二者都提供 `cv2`。
 
 **生成印版**
 
@@ -103,6 +105,41 @@ python verify_decode.py photo.jpg --digits 13800138000
 python batch_decode.py photos/ --csv result.csv --save-figs
 ```
 
+**库接口（生产解码）**
+
+命令行和 `from arrow_decode import decode` 走同一道门。默认载体是**边缘**；内孔要显式选择，本接口不改内孔算法，也不抬极限档成功率。
+
+```python
+from arrow_decode import decode
+
+result = decode(image)                    # carrier="edge"
+# result = decode(image, carrier="inner")
+# result = decode("photo.jpg")            # 路径也可以
+
+if result.accepted:
+    phone = result.digits                 # 仅此时是可信号码
+    # result.margin / result.cc / result.logo_scale / result.mean_conf
+else:
+    phone = None                          # result.digits 一定是 None
+    # result.candidate_digits 是研究解码器的原始读数，不可当号码使用
+    # result.reason：low_margin / low_cc / invalid_payload / sync_failed / ...
+```
+
+接受条件（两个门同时过，外加码字本身是 11 位合法号码）：
+
+| 门 | 默认 | 依据 |
+|---|---|---|
+| 码字裕度 `margin` | ≥ 1.8 | 真码 ≥ 2.0，噪声/无码 ≤ 1.4 |
+| 配准 `cc` | ≥ 0.85 | 与解码器内部「这条路径能不能信」的门相同；低于此值时置信度可能虚高 |
+
+任一不过：`accepted=False`，`digits=None`。批量 CSV 的「号码」列同样留空。研究压测（`arrow_wm.py --bench`、`arrow_inner.py --bench`）仍直接调用原来的解码器，**不经过这道门**，已发表的成功率数字不变。`arrow_wm.py --no-ecc`（库接口 `use_ecc_refine=False`）不算配准分，`cc` 保持 0，这时只跳过 cc 门，裕度门和其他接受条件仍在。默认 ECC 开着。
+
+本地自检（也是 CI 在跑的那条）：
+
+```bash
+python ci_smoke.py
+```
+
 **验真模式**（照片糊到盲解失败、但你知道嫌疑号码时）
 
 ```bash
@@ -135,9 +172,13 @@ python arrow_wm.py --bench -n 50 --seed 6000
 ```
 arrow_wm.py            边缘载体核心（嵌入 / 解码 / 仿真 / 压测）
 arrow_inner.py         内孔载体核心
+arrow_decode.py        生产解码 API（边缘默认，内孔可选，裕度 + cc 硬门）
 gen_plate.py           生成印版（单张 / 批量 / 两种载体）
 verify_decode.py       单张解码 + 核验图 + 验真模式
 batch_decode.py        批量解码（扫目录 / CSV / 批量出图）
+ci_smoke.py            嵌入/解码冒烟 + 接受门单测（CI 入口）
+requirements.txt       运行与 CI 依赖
+.github/workflows/ci.yml  安装依赖并跑 ci_smoke.py
 make_test_samples.py   生成 10 组随机号码实测样张 + A4 打印排版图
 compare_carrier.py     两种载体的定量对比
 compare_same_payload.py 同一号码的三版对照图
@@ -154,7 +195,7 @@ samples/               样张与插图
 - **容量由边缘长度决定**，不是面积。2200 px 宽的 Logo 有效边缘约 2000 px，70 bit 就是每 bit 28 px。想多写只能加大调制幅度（视觉更明显）或换更大的载体。
 - **极限档 74%** 是物理信噪比的边界。其中约一半失败来自配准、一半来自信号不足；后者受限于调制幅度，加大就破坏隐蔽性。
 - **拍摄建议**：距离 8–15 cm，让 Logo 占画面 1/3 以上，避开强反光（最主要的干扰源）。倾斜 30° 以内能自动矫正。低于原图 0.2 倍缩放时信号会不足。
-- **无码图也会输出一个号码**——判决器总要给出 0/1。请用**码字裕度**判定是否真的有码（真码 ≥ 2.0，噪声 ≤ 1.4，门限取 1.8）。用 `mean|conf|` 判定会有 40% 以上的误报。
+- **研究解码器对无码图仍会吐出一个号码**——判决器总要给出 0/1。生产入口 `arrow_decode.decode` 用硬门把它拒掉：码字裕度低于 1.8，或配准 cc 低于 0.85，或码字不是合法 11 位号码时，`accepted=False` 且 `digits=None`。真码裕度 ≥ 2.0，噪声/无码 ≤ 1.4。不要用 `mean|conf|` 做有无水印的判据（误报可达 40% 以上）；内孔命令行以前的 0.012 置信度提示已改成与边缘相同的裕度 + cc 门。
 
 ## 理论出处
 

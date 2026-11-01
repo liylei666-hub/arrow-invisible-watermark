@@ -1,0 +1,7 @@
+# Runtime for the decode path and CI smoke.
+# opencv-python (GUI build) also works locally; CI uses the headless wheel.
+numpy
+opencv-python-headless
+# Figure scripts (verify_decode, benches). Not imported by arrow_decode.
+matplotlib
+pillow
