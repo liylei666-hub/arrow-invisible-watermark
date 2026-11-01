@@ -27,3 +27,9 @@ ARROW_watermarked_pro.png
 .DS_Store
 Thumbs.db
 .workbuddy-ai/
+
+# 本机部署脚本（含令牌，不入库）
+*.bat
+
+# 生成物
+*.pdf

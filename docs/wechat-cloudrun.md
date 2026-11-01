@@ -121,12 +121,37 @@ curl -s "https://<控制台给出的默认域名>/health"
 
 平台限制（调用还没进容器就会被拒）：
 
-- 文本请求体约 **100 KiB**。`application/json` 算文本，手机原图的 base64 通常会触发 `errCode: -606001`（请求包超过 100KB）。JSON 只适合压得很小的图。
-- 二进制请求体约 **20 MiB**，和本服务自己的 20 MB 上限对齐。照片用 `ArrayBuffer` 走原始字节。
+- 请求体**实际只有约 100 KiB**，文本和二进制都一样。官方原文是「请求大小限制 100KiB（对象类型限制 20 MiB，请求中不建议包含图片）」——
+  这里的「对象类型 20 MiB」不是指 `ArrayBuffer`。
+  实测：219 KB 的 `ArrayBuffer`，`content-type: application/octet-stream` 与 `config.env` 都写对了，
+  仍被网关直接拒掉：`cloud.callContainer:fail input data size too large (> 100KB)`，容器日志里看不到这次请求。
+- 所以照片必须**先在客户端压到 100 KiB 以内**再发，见下面「照片：先压到 100 KiB」。
+- `application/json` 的 base64 同样受这 100 KiB 限制，而且 base64 还会再涨 1/3，更不划算。
 - 响应约 1 MB。本接口的 JSON 远小于这个上限。
 - `timeout` 最大 **15 秒**（15000 毫秒）。服务已经常驻（最小副本数 1）时，单次解码大约 0.5–2.5 秒，放得下。
 
 返回字段、`accepted` / `digits` / `reason_text` 的用法与 [miniprogram-integration.md](miniprogram-integration.md) 相同。`candidate_digits` 不能当号码展示。
+
+### 照片：先压到 100 KiB
+
+小程序端不要直接发原图。做法是画到 canvas、导出 JPEG、按体积逐档降规格：
+
+```
+1400 / q84  →  1200 / q78  →  1000 / q72  →  800 / q66
+```
+
+实测（内孔版，depth 6，同一张模拟手机照片）：
+
+| 规格 | 体积 | 解码裕度 |
+|---|---|---|
+| 1600 / q90 | 127 KB ✗ | — |
+| 1400 / q84 | 63 KB ✓ | 5.99 |
+| 1200 / q78 | 34 KB ✓ | 6.00 |
+| 1000 / q72 | 20 KB ✓ | 5.92 |
+| 800 / q66 | 13 KB ✓ | 5.82 |
+
+判定门限是 2.0，压到 13 KB 都还有 5.82 的裕度——因为水印是**几何**信息，不在高频细节里，
+JPEG 量化伤不到它。真正会伤到的是失焦和反光，不是压缩。
 
 ### 照片：原始字节
 
