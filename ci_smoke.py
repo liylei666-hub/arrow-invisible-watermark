@@ -68,6 +68,48 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(result.digits)
         self.assertEqual(result.reason, "sync_failed")
 
+    def test_ecc_off_skips_default_cc_gate_only(self):
+        # ECC off does not produce a registration score. The default 0.85
+        # cut must not reject a legal high-margin read, and must not let a
+        # low-margin read through.
+        high = {
+            "ok": True, "digits": "13800138000", "payload_valid": True,
+            "margin": 4.0, "cc": 0.0, "mean_conf": 0.05, "logo_scale": 1.0,
+        }
+        skipped = AD.effective_cc_threshold(AD.CC_THRESHOLD, use_ecc_refine=False)
+        self.assertIsNone(skipped)
+        accepted = AD.apply_gate(high, cc_threshold=skipped)
+        self.assertTrue(accepted.accepted, accepted.public_dict())
+        self.assertEqual(accepted.digits, "13800138000")
+        self.assertEqual(accepted.cc, 0.0)
+        self.assertLess(accepted.cc, AD.CC_THRESHOLD)
+        self.assertIsNone(accepted.cc_threshold)
+        self.assertGreaterEqual(accepted.margin, AD.MARGIN_THRESHOLD)
+        self.assertNotIn("low_cc", accepted.reason)
+
+        rejected = AD.apply_gate(dict(high, margin=1.2), cc_threshold=skipped)
+        self.assertFalse(rejected.accepted, rejected.public_dict())
+        self.assertIsNone(rejected.digits)
+        self.assertEqual(rejected.candidate_digits, "13800138000")
+        self.assertIn("low_margin", rejected.reason)
+        self.assertNotIn("low_cc", rejected.reason)
+        self.assertLess(rejected.margin, AD.MARGIN_THRESHOLD)
+
+        # Explicit non-default threshold still applies with ECC off.
+        # None always skips, including when ECC stays on.
+        self.assertEqual(
+            AD.effective_cc_threshold(0.9, use_ecc_refine=False), 0.9)
+        self.assertIsNone(
+            AD.effective_cc_threshold(None, use_ecc_refine=False))
+        self.assertIsNone(
+            AD.effective_cc_threshold(None, use_ecc_refine=True))
+        self.assertEqual(
+            AD.effective_cc_threshold(AD.CC_THRESHOLD, use_ecc_refine=True),
+            AD.CC_THRESHOLD)
+        still_gated = AD.apply_gate(high, cc_threshold=0.9)
+        self.assertFalse(still_gated.accepted)
+        self.assertIn("low_cc", still_gated.reason)
+
     def test_clear_read_is_accepted(self):
         raw = {
             "ok": True, "digits": "13800138000", "payload_valid": True,
@@ -96,6 +138,8 @@ class RoundtripTests(unittest.TestCase):
         self.assertEqual(result.carrier, "edge")
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
         self.assertGreaterEqual(result.cc, AD.CC_THRESHOLD)
+        self.assertEqual(result.cc_threshold, AD.CC_THRESHOLD)
+        self.assertTrue(self.edge.use_ecc_refine)
         self.assertIsNotNone(result.logo_scale)
 
         # Same plate via the function entry and via a file path.
@@ -131,6 +175,43 @@ class RoundtripTests(unittest.TestCase):
         self.assertEqual(result.digits, self.digits)
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
         self.assertGreaterEqual(result.cc, AD.CC_THRESHOLD)
+
+    def test_no_ecc_clean_accepts_unmarked_rejects_on_margin(self):
+        # Equivalent to arrow_wm.py --no-ecc: do not pass cc_threshold.
+        # A clean plate must accept with cc left at 0; an unmarked plate
+        # must still fail the margin gate and must not be rejected for cc.
+        session = AD.Decoder(
+            carrier="edge", design=self.edge.design, use_ecc_refine=False)
+        self.assertFalse(session.use_ecc_refine)
+        self.assertIsNone(session.cc_threshold)
+        self.assertEqual(session.margin_threshold, AD.MARGIN_THRESHOLD)
+
+        import arrow_wm as A
+        plate = A.WatermarkEmbedder(
+            self.edge.design, verbose=False).embed(self.digits)["plate"]
+        result = session.decode(plate)
+        self.assertTrue(result.accepted, result.public_dict())
+        self.assertEqual(result.digits, self.digits)
+        self.assertEqual(result.carrier, "edge")
+        self.assertLess(result.cc, AD.CC_THRESHOLD, result.public_dict())
+        self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
+        self.assertIsNone(result.cc_threshold)
+        self.assertNotIn("low_cc", result.reason)
+
+        unmarked = session.decode(self.edge.design.template)
+        self.assertFalse(unmarked.accepted, unmarked.public_dict())
+        self.assertIsNone(unmarked.digits)
+        self.assertTrue(unmarked.ok, unmarked.public_dict())
+        self.assertIn("low_margin", unmarked.reason)
+        self.assertNotIn("low_cc", unmarked.reason)
+        self.assertLess(unmarked.margin, AD.MARGIN_THRESHOLD, unmarked.public_dict())
+
+        via_fn = AD.decode(
+            plate, design=self.edge.design, use_ecc_refine=False)
+        self.assertTrue(via_fn.accepted, via_fn.public_dict())
+        self.assertEqual(via_fn.digits, self.digits)
+        self.assertIsNone(via_fn.cc_threshold)
+        self.assertLess(via_fn.cc, AD.CC_THRESHOLD)
 
 
 if __name__ == "__main__":

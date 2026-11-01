@@ -132,7 +132,7 @@ else:
 | 码字裕度 `margin` | ≥ 1.8 | 真码 ≥ 2.0，噪声/无码 ≤ 1.4 |
 | 配准 `cc` | ≥ 0.85 | 与解码器内部「这条路径能不能信」的门相同；低于此值时置信度可能虚高 |
 
-任一不过：`accepted=False`，`digits=None`。批量 CSV 的「号码」列同样留空。研究压测（`arrow_wm.py --bench`、`arrow_inner.py --bench`）仍直接调用原来的解码器，**不经过这道门**，已发表的成功率数字不变。`arrow_wm.py --no-ecc` 不算配准分，这时只保留裕度门。
+任一不过：`accepted=False`，`digits=None`。批量 CSV 的「号码」列同样留空。研究压测（`arrow_wm.py --bench`、`arrow_inner.py --bench`）仍直接调用原来的解码器，**不经过这道门**，已发表的成功率数字不变。`arrow_wm.py --no-ecc`（库接口 `use_ecc_refine=False`）不算配准分，`cc` 保持 0，这时只跳过 cc 门，裕度门和其他接受条件仍在。默认 ECC 开着。
 
 本地自检（也是 CI 在跑的那条）：
 
