@@ -112,16 +112,19 @@ class GatewayPrefixMiddleware:
 def _warmup_carriers() -> list[str]:
     """Which sessions to build before serving.
 
-    ``DECODE_WARMUP=1`` (default) loads edge and inner.
-    ``DECODE_WARMUP=edge`` loads only the production default.
+    ``DECODE_WARMUP=1`` (default) loads inner and edge.
+    ``DECODE_WARMUP=inner`` or ``default`` loads only the production default.
+    ``DECODE_WARMUP=edge`` loads only the edge carrier (legacy plates).
     ``DECODE_WARMUP=0`` skips warmup (tests).
     """
     flag = os.environ.get("DECODE_WARMUP", "1").strip().lower()
     if flag in ("0", "false", "no", "off"):
         return []
-    if flag in ("edge", "default"):
+    if flag in ("inner", "default"):
         return [AD.DEFAULT_CARRIER]
-    return [AD.DEFAULT_CARRIER, "inner"]
+    if flag == "edge":
+        return ["edge"]
+    return [AD.DEFAULT_CARRIER, "edge"]
 
 
 def normalize_layout(raw: Optional[str]) -> str:
@@ -261,7 +264,7 @@ def carrier_from_value(raw: Optional[str]) -> str:
 
 
 def pick_carrier(query_value: Optional[str], form) -> str:
-    """Query ``carrier`` wins over the form field. Default is ``edge``."""
+    """Query ``carrier`` wins over the form field. Default is ``inner``."""
     raw = query_value
     if raw is None or str(raw).strip() == "":
         item = form.get("carrier")
@@ -320,7 +323,7 @@ async def finish_decode(carrier: str, data: bytes, *,
 async def decode_json_body(request: Request, query_carrier: Optional[str], *,
                            include_candidate: bool = False,
                            query_layout: Optional[str] = None):
-    """``{"image_base64": "...", "carrier": "edge"}``. Query carrier wins."""
+    """``{"image_base64": "...", "carrier": "inner"}``. Query carrier wins."""
     length = declared_length(request)
     if length is not None and length > _BASE64_CHAR_CAP + 4096:
         raise HTTPException(status_code=413, detail="image too large")
@@ -353,7 +356,7 @@ async def decode_json_body(request: Request, query_carrier: Optional[str], *,
 async def decode_raw_body(request: Request, query_carrier: Optional[str], *,
                           include_candidate: bool = False,
                           query_layout: Optional[str] = None):
-    """Raw image bytes. ``carrier`` is the query param (default ``edge``)."""
+    """Raw image bytes. ``carrier`` is the query param (default ``inner``)."""
     length = declared_length(request)
     if length is not None and length > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="image too large")

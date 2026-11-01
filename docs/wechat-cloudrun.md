@@ -115,9 +115,9 @@ curl -s "https://<控制台给出的默认域名>/health"
 
 | Content-Type | 正文 | `carrier` |
 |---|---|---|
-| `multipart/form-data` | 文件字段 `image`（以及原来的别名） | 查询参数优先，否则表单字段，默认 `edge` |
-| `application/json` | `{"image_base64":"<base64>","carrier":"edge"}` | 查询参数优先，否则 JSON 字段，默认 `edge` |
-| `application/octet-stream` 或 `image/jpeg` / `image/png` 等 | 图片原始字节 | 只看查询参数，默认 `edge` |
+| `multipart/form-data` | 文件字段 `image`（以及原来的别名） | 查询参数优先，否则表单字段，默认 `inner` |
+| `application/json` | `{"image_base64":"<base64>","carrier":"inner"}` | 查询参数优先，否则 JSON 字段，默认 `inner` |
+| `application/octet-stream` 或 `image/jpeg` / `image/png` 等 | 图片原始字节 | 只看查询参数，默认 `inner` |
 
 平台限制（调用还没进容器就会被拒）：
 
@@ -164,7 +164,7 @@ const filePath = tempFilePath; // wx.chooseMedia / chooseImage 的临时路径
 const data = wx.getFileSystemManager().readFileSync(filePath);
 
 wx.cloud.callContainer({
-  path: "/decode?carrier=edge",
+  path: "/decode?carrier=inner",
   method: "POST",
   timeout: 15000,
   header: {
@@ -185,7 +185,7 @@ wx.cloud.callContainer({
 });
 ```
 
-未设置 `DECODE_TOKEN` 时不要带 `X-Decode-Token`。只拍内孔印版时把查询改成 `carrier=inner`。默认不要在界面上做载体开关。
+未设置 `DECODE_TOKEN` 时不要带 `X-Decode-Token`。省略 `carrier` 与 `carrier=inner` 相同，都是内孔。旧边缘印版才把查询改成 `carrier=edge`。默认不要在界面上做载体开关。
 
 ### 小图：JSON / base64
 
@@ -202,7 +202,7 @@ wx.cloud.callContainer({
   },
   data: {
     image_base64: wx.getFileSystemManager().readFileSync(filePath, "base64"),
-    carrier: "edge",
+    carrier: "inner",
   },
   success(res) {
     const body = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
@@ -221,6 +221,6 @@ wx.cloud.callContainer({
 
 ```bash
 curl -s -H "X-Decode-Token: <DECODE_TOKEN>" \
-  -F "image=@samples/edge/ARROW_13800138000.png" \
+  -F "image=@samples/inner/ARROW_13800138000.png" \
   "https://<控制台给出的默认域名>/decode"
 ```

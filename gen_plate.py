@@ -2,16 +2,16 @@
 
 用法示例
 --------
-# 单张，边缘载体（默认幅度 arrow_wm.MOD_DEPTH，当前 6 px），输出到当前目录
+# 单张，内孔载体（默认）。边缘幅度仍是 arrow_wm.MOD_DEPTH（当前 6 px）
 python gen_plate.py 13800138000
 
-# 单张，内孔载体，指定输出文件
-python gen_plate.py 13800138000 --carrier inner -o 13800138000_内孔.png
+# 指定输出文件（默认仍是内孔）
+python gen_plate.py 13800138000 -o 13800138000.png
 
 # 批量，两版都出，输出到 out 目录（同时生成 1bit 二值版）
 python gen_plate.py 13800138000 13912345678 18600001234 --carrier both -d out --1bit
 
-# 从文本文件读号码（每行一个，空行与 # 开头的行忽略）
+# 从文本文件读号码（每行一个，空行与 # 开头的行忽略）。旧边缘印版显式 --carrier edge
 python gen_plate.py --file 号码.txt --carrier edge -d out
 """
 from __future__ import annotations
@@ -58,8 +58,8 @@ def main(argv=None) -> int:
         epilog=__doc__)
     ap.add_argument("digits", nargs="*", help="11 位号码，可给多个")
     ap.add_argument("--file", default=None, help="号码清单文件（每行一个）")
-    ap.add_argument("--carrier", choices=("edge", "inner", "both"), default="edge",
-                    help="edge=边缘载体（默认，鲁棒性最好）；inner=内孔载体（外轮廓不变）")
+    ap.add_argument("--carrier", choices=("edge", "inner", "both"), default="inner",
+                    help="inner=内孔载体（默认）；edge=边缘载体（旧印版，需显式指定）；both=两版都出")
     ap.add_argument("-o", "--out", default=None, help="单张时的输出文件名")
     ap.add_argument("-d", "--outdir", default=".", help="批量时的输出目录")
     ap.add_argument("--1bit", dest="onebit", action="store_true",
@@ -124,9 +124,10 @@ def main(argv=None) -> int:
         print(f"自检通过 {n_ok}/{len(payloads) * len(carriers)}")
     print(f"输出目录：{os.path.abspath(args.outdir)}")
     print("\n解码：")
-    print(f"  {sys.executable} arrow_wm.py --decode 照片1.jpg 照片2.jpg      # 边缘载体")
     if "inner" in carriers:
         print(f"  {sys.executable} arrow_inner.py --decode 照片1.jpg            # 内孔载体")
+    if "edge" in carriers:
+        print(f"  {sys.executable} arrow_wm.py --decode 照片1.jpg 照片2.jpg      # 边缘载体")
     return 0
 
 

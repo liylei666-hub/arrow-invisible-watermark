@@ -14,7 +14,7 @@ https://ms-2w5g828w-100050884192.gw.ap-shanghai.ti.tencentcs.com/ms-2w5g828w/dec
 
 | 方法 | 容器路径 | 作用 |
 |---|---|---|
-| `POST` | `/decode` | 解码。multipart 字段 `image`，可选 `carrier`（默认 `edge`） |
+| `POST` | `/decode` | 解码。multipart 字段 `image`，可选 `carrier`（默认 `inner`；旧边缘印版传 `edge`） |
 | `GET` | `/health` | `{"status":"ok"}`。不校验 `X-Decode-Token` |
 
 公网调用时把前缀接回去即可：

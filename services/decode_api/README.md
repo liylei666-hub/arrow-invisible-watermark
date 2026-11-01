@@ -1,6 +1,6 @@
 # ARROW 解码 HTTP 服务
 
-把仓库根目录的 `arrow_decode.Decoder` 包成一个小 HTTP 服务，给微信小程序和腾讯云 TI-ONE 在线服务用。算法和接受门都不在这里改：默认载体仍是边缘（`edge`），`inner` 只是显式选项。
+把仓库根目录的 `arrow_decode.Decoder` 包成一个小 HTTP 服务，给微信小程序和腾讯云 TI-ONE 在线服务用。算法不在这里改：默认载体是内孔（`inner`），旧边缘印版用显式 `edge`。
 
 契约见 [docs/miniprogram-integration.md](../../docs/miniprogram-integration.md)。TI-ONE 上怎么挂、以及不要动其他已有服务，见 [TI-ONE.md](TI-ONE.md)。微信云托管（服务名 `arrow-decode`、GitHub 构建、`callContainer`）见 [docs/wechat-cloudrun.md](../../docs/wechat-cloudrun.md)。
 
@@ -26,7 +26,7 @@ cd services/decode_api
 python -m uvicorn app:app --host 127.0.0.1 --port 8501
 ```
 
-进程起来后会先加载边缘和内孔两个 `Decoder`（SIFT 模板）。日志出现 `[decode_api] ready` 之后 `/health` 才会通。只预热边缘可以设 `DECODE_WARMUP=edge`。
+进程起来后会先加载内孔和边缘两个 `Decoder`（SIFT 模板）。日志出现 `[decode_api] ready` 之后 `/health` 才会通。只预热内孔设 `DECODE_WARMUP=inner`；只预热边缘设 `DECODE_WARMUP=edge`。
 
 健康检查：
 
@@ -36,20 +36,20 @@ curl -s http://127.0.0.1:8501/health
 
 期望：`{"status":"ok"}`。
 
-解码（字段名用 `image`；`file` / `img` / `photo` / `picture` 也能认）。默认载体是 `edge`：
-
-```bash
-curl -s -F "image=@samples/edge/ARROW_13800138000.png" \
-  http://127.0.0.1:8501/decode
-```
-
-指定内孔，查询参数和表单字段都可以，查询参数优先：
+解码（字段名用 `image`；`file` / `img` / `photo` / `picture` 也能认）。默认载体是 `inner`：
 
 ```bash
 curl -s -F "image=@samples/inner/ARROW_13800138000.png" \
-  "http://127.0.0.1:8501/decode?carrier=inner"
+  http://127.0.0.1:8501/decode
+```
 
-curl -s -F "image=@photo.jpg" -F "carrier=edge" \
+旧边缘印版要显式 `carrier=edge`。查询参数和表单字段都可以，查询参数优先：
+
+```bash
+curl -s -F "image=@samples/edge/ARROW_13800138000.png" \
+  "http://127.0.0.1:8501/decode?carrier=edge"
+
+curl -s -F "image=@photo.jpg" -F "carrier=inner" \
   http://127.0.0.1:8501/decode
 ```
 
@@ -65,7 +65,7 @@ curl -s -F "image=@photo.jpg" -F "carrier=edge" \
 
 `POST /decode` 还接受另外两种正文，返回和鉴权与 multipart 相同：
 
-- `application/json`：`{"image_base64":"<base64>","carrier":"edge"}`。查询参数 `carrier` 优先于 JSON 字段。
+- `application/json`：`{"image_base64":"<base64>","carrier":"inner"}`。查询参数 `carrier` 优先于 JSON 字段。省略 `carrier` 也是内孔；旧边缘印版传 `edge`。
 - `application/octet-stream` 或 `image/jpeg` / `image/png`：正文就是图片字节，`carrier` 只看查询参数。
 
 微信 `wx.cloud.callContainer` 用这两种，因为组 multipart 不稳定。控制台步骤和示例在 [docs/wechat-cloudrun.md](../../docs/wechat-cloudrun.md)。

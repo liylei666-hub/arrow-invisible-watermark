@@ -2,11 +2,11 @@
 
 用法
 ----
-# 解码目录下所有图片（默认边缘载体）
+# 解码目录下所有图片（默认内孔载体）
 python batch_decode.py 照片目录
 
-# 内孔载体 + 输出 CSV
-python batch_decode.py 照片目录 --carrier inner --csv 结果.csv
+# 旧边缘印版 + 输出 CSV
+python batch_decode.py 照片目录 --carrier edge --csv 结果.csv
 
 # 直接给若干文件
 python batch_decode.py a.jpg b.jpg c.jpg
@@ -47,7 +47,8 @@ def main(argv=None) -> int:
         description="批量解码 ARROW 隐形水印",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("paths", nargs="+", help="图片文件或目录，可混给多个")
-    ap.add_argument("--carrier", choices=("edge", "inner"), default="edge")
+    ap.add_argument("--carrier", choices=("edge", "inner"), default="inner",
+                    help="inner=内孔载体（默认）；edge=旧边缘印版")
     ap.add_argument("--csv", default=None, help="把结果写成 CSV")
     ap.add_argument("--save-figs", action="store_true", help="逐张输出核验图")
     ap.add_argument("--thresh", type=float, default=None,

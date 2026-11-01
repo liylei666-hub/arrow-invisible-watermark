@@ -1,8 +1,8 @@
 """Fast production-decode smoke. Used by GitHub Actions and local checks.
 
 Covers the accept/reject gate without a robustness bench, plus one clean
-embed/decode roundtrip on the edge carrier (the production default) and one
-on the inner carrier. Inner extreme-tier rates are intentionally not measured.
+embed/decode roundtrip on the edge carrier and one on the inner carrier
+(the production default). Inner extreme-tier rates are intentionally not measured.
 """
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ import arrow_decode as AD
 
 
 class GateTests(unittest.TestCase):
-    def test_default_carrier_is_edge(self):
-        self.assertEqual(AD.DEFAULT_CARRIER, "edge")
+    def test_default_carrier_is_inner(self):
+        self.assertEqual(AD.DEFAULT_CARRIER, "inner")
         self.assertEqual(
-            inspect.signature(AD.decode).parameters["carrier"].default, "edge")
+            inspect.signature(AD.decode).parameters["carrier"].default, "inner")
         self.assertEqual(
-            inspect.signature(AD.Decoder).parameters["carrier"].default, "edge")
+            inspect.signature(AD.Decoder).parameters["carrier"].default, "inner")
 
     def test_unknown_carrier_rejected(self):
         with self.assertRaises(ValueError):
@@ -128,6 +128,24 @@ class GateTests(unittest.TestCase):
         self.assertIn("low_logo_scale", result.reason)
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
         self.assertLess(result.logo_scale, AD.LOGO_SCALE_MIN)
+
+    def test_gate_photo_inner_fields_are_accepted(self):
+        # Real inner photo 17701234567: correct candidate, previously rejected
+        # only by logo_scale≈0.1595 and margin_min≈0.604. Those cuts are now
+        # 0.15 and 0.55. The 0.077 tiny-logo case and the ~0.325 near-tie stay
+        # rejected by the tests above and below.
+        raw = {
+            "ok": True, "digits": "17701234567", "payload_valid": True,
+            "margin": 2.80, "margin_min": 0.604, "cc": 0.975,
+            "mean_conf": 1.75, "logo_scale": 0.1595, "pad_bits": [0, 0, 0],
+        }
+        result = AD.apply_gate(raw, carrier="inner")
+        self.assertTrue(result.accepted, result.public_dict())
+        self.assertEqual(result.status, "accepted")
+        self.assertEqual(result.digits, "17701234567")
+        self.assertEqual(result.candidate_digits, "17701234567")
+        self.assertGreaterEqual(result.logo_scale, AD.LOGO_SCALE_MIN)
+        self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
 
     def test_clear_read_is_accepted(self):
         raw = {
@@ -261,7 +279,7 @@ class RoundtripTests(unittest.TestCase):
         self.assertIsNotNone(result.logo_scale)
 
         # Same plate via the function entry and via a file path.
-        via_fn = AD.decode(plate, design=self.edge.design)
+        via_fn = AD.decode(plate, carrier="edge", design=self.edge.design)
         self.assertTrue(via_fn.accepted, via_fn.public_dict())
         self.assertEqual(via_fn.digits, self.digits)
         fd, path = tempfile.mkstemp(suffix=".png")
@@ -329,7 +347,7 @@ class RoundtripTests(unittest.TestCase):
         self.assertLess(unmarked.margin, AD.MARGIN_THRESHOLD, unmarked.public_dict())
 
         via_fn = AD.decode(
-            plate, design=self.edge.design, use_ecc_refine=False)
+            plate, carrier="edge", design=self.edge.design, use_ecc_refine=False)
         self.assertTrue(via_fn.accepted, via_fn.public_dict())
         self.assertEqual(via_fn.digits, self.digits)
         self.assertIsNone(via_fn.cc_threshold)
@@ -427,7 +445,7 @@ class ServiceContractTests(unittest.TestCase):
             self.client.get("/ms-2w5g828w/health").json(), {"status": "ok"})
         prefixed = self._post("/ms-newid/ms-newid/decode")
         self.assertEqual(prefixed.status_code, 200, prefixed.text)
-        self.assertEqual(self.calls[0][0], "edge")
+        self.assertEqual(self.calls[0][0], "inner")
 
     def test_default_carrier_and_public_dict_shape(self):
         response = self._post()
@@ -446,11 +464,11 @@ class ServiceContractTests(unittest.TestCase):
         self.assertTrue(body["accepted"])
         self.assertEqual(body["status"], "accepted")
         self.assertEqual(body["digits"], "13800138000")
-        self.assertEqual(body["carrier"], "edge")
+        self.assertEqual(body["carrier"], "inner")
         self.assertEqual(body["reason"], "")
         self.assertEqual(body["reason_text"], "接受")
         self.assertTrue(body["ok"])
-        self.assertEqual(self.calls, [("edge", 1, "2")])
+        self.assertEqual(self.calls, [("inner", 1, "2")])
 
     def test_reject_omits_candidate_and_ok_is_not_success(self):
         self.raw = {
@@ -570,7 +588,7 @@ class ServiceContractTests(unittest.TestCase):
         self.assertNotIn("candidate_digits", body)
         self.assertEqual(body["reason"], "unreadable")
         self.assertEqual(body["reason_text"], "读不到图像")
-        self.assertEqual(self.calls, [("edge", 0, "2")])
+        self.assertEqual(self.calls, [("inner", 0, "2")])
 
     def test_token_guards_decode_but_not_health(self):
         os.environ["DECODE_TOKEN"] = "devsecret"

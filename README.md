@@ -76,17 +76,17 @@ pip install -r requirements.txt
 **生成印版**
 
 ```bash
-# 单张，边缘载体，输出到当前目录
+# 单张，内孔载体（默认），输出到当前目录
 python gen_plate.py 13800138000
 
-# 内孔载体
-python gen_plate.py 13800138000 --carrier inner -o out.png
+# 旧边缘印版：显式 --carrier edge
+python gen_plate.py 13800138000 --carrier edge -o out.png
 
 # 批量，两版都出，附带 1bit 二值版
 python gen_plate.py 13800138000 13912345678 18600001234 --carrier both -d out --1bit
 
-# 号码写在文本文件里（每行一个，# 开头为注释）
-python gen_plate.py --file numbers.txt --carrier edge -d out
+# 号码写在文本文件里（每行一个，# 开头为注释）。默认内孔；旧边缘印版加 --carrier edge
+python gen_plate.py --file numbers.txt -d out
 ```
 
 生成后会自动解一遍并打印 OK / FAIL，不用再单独验。
@@ -94,28 +94,31 @@ python gen_plate.py --file numbers.txt --carrier edge -d out
 **解码照片**
 
 ```bash
-# 边缘载体（可一次给多张）
+# 内孔载体（生产默认；可一次给多张）
+python batch_decode.py photo1.jpg photo2.jpg
+
+# 旧边缘印版
 python arrow_wm.py --decode photo1.jpg photo2.jpg
 
-# 内孔载体
+# 内孔研究入口
 python arrow_inner.py --decode photo1.jpg
 
-# 单张 + 核验图（输入/检测框、矫正图、70 bit 逐比特置信度）
+# 单张边缘核验图（旧边缘印版）
 python verify_decode.py photo.jpg --digits 13800138000
 
-# 批量扫目录，出表格 + CSV
+# 批量扫目录，出表格 + CSV（默认内孔；旧边缘印版加 --carrier edge）
 python batch_decode.py photos/ --csv result.csv --save-figs
 ```
 
 **库接口（生产解码）**
 
-命令行和 `from arrow_decode import decode` 走同一道门。默认载体是**边缘**；内孔要显式选择，本接口不改内孔算法，也不抬极限档成功率。
+命令行和 `from arrow_decode import decode` 走同一道门。默认载体是**内孔**；旧边缘印版要显式 `carrier="edge"` 或 `--carrier edge`。边缘实现仍在，本接口不改它的算法。
 
 ```python
 from arrow_decode import decode
 
-result = decode(image)                    # carrier="edge"
-# result = decode(image, carrier="inner")
+result = decode(image)                    # carrier="inner"
+# result = decode(image, carrier="edge")  # 旧边缘印版
 # result = decode("photo.jpg")            # 路径也可以
 
 if result.accepted:
@@ -134,10 +137,10 @@ else:
 | 门 | 默认 | 依据 |
 |---|---|---|
 | 裕度均值 `margin` / `margin_mean` | ≥ 1.8 | 有码/无码门。作用在按期望幅度归一化后的 soft_n 上，再除以标准差，不是像素门，也不是旧的 1.8 px 深度。真码均值 ≥ 2.0，噪声/无码 ≤ 1.4。单组选错会被其余组抬高 |
-| 单组最小 `margin_min` | ≥ 1.0 | 十组里最弱的一组。均值高但这一组接近打平时拒绝 |
+| 单组最小 `margin_min` | ≥ 0.55 | 十组里最弱的一组。均值高但这一组接近打平时拒绝。真机内孔照最弱组约 0.60 仍接受；近乎打平的冒烟样本约 0.33 仍拒绝 |
 | 第 0 组补零 | 必须是 `000` | 编码时 37 bit 前补了 3 个 0。读出来不是 `000` 则 `reason=pad_mismatch` |
 | 配准 `cc` | ≥ 0.85 | 与解码器内部「这条路径能不能信」的门相同；低于此值时置信度可能虚高 |
-| 画面尺度 `logo_scale` | ≥ 0.20 | Logo 在照片里的宽度 / 2200。低于此值 `reason=low_logo_scale`。±6 px 在 0.08 倍尺度上只有约 ±0.5 个相机像素 |
+| 画面尺度 `logo_scale` | ≥ 0.15 | Logo 在照片里的宽度 / 2200。低于此值 `reason=low_logo_scale`。文档里的 0.077 小图仍拒绝。±6 px 在 0.08 倍尺度上只有约 ±0.5 个相机像素 |
 
 任一不过：`accepted=False`，`status="rejected"`，`digits=None`。批量 CSV 的「号码」列同样留空；核验图标题写「拒绝（结果不可信）」，不把候选号画成解码结果。
 
@@ -237,7 +240,7 @@ v1@6 和 v1@1.8 的极限配准残差（ECC 角点位移，px）P50/P95：20.5/3
 
 按测量排：
 
-1. 原图 `logo_scale=0.077`，低于 0.20。配准没有失败（cc=0.97）。±6 px 乘这个尺度约 ±0.46 个相机像素，±1.8 px 约 ±0.14 个像素，两种深度都采不到波形。生产门因此多一个 `low_logo_scale`，号码仍然是 `None`。
+1. 原图 `logo_scale=0.077`，低于现行门 0.15（改门前是 0.20）。配准没有失败（cc=0.97）。±6 px 乘这个尺度约 ±0.46 个相机像素，±1.8 px 约 ±0.14 个像素，两种深度都采不到波形。生产门因此多一个 `low_logo_scale`，号码仍然是 `None`。
 2. 把同一张图放大到尺度 0.31 之后，`mean_conf` 仍是 0.012（干净印版是 0.128），相对真值的 BER 仍在 0.5 附近，补零也不是 `000`。放大没有多出光学采样。Logo 带上方纸面的竖向亮度起伏大约 2 个灰度级，折痕看得到，但解释不了这档误码；测不到的是差分宽度本身。
 3. 换成冻结的 v1@1.8 或 v1@6，验真 z 仍小于 1（干净印版是 8.3），间隙是负的，判定「不包含」。不是门限差一点点，也不是新布局把旧印版解错了。裕度门没有为这张图放宽。
 
@@ -246,7 +249,7 @@ v1@6 和 v1@1.8 的极限配准残差（ECC 角点位移，px）P50/P95：20.5/3
 ```
 arrow_wm.py            边缘载体核心（嵌入 / 解码 / 仿真 / 压测）
 arrow_inner.py         内孔载体核心
-arrow_decode.py        生产解码 API（边缘默认，内孔可选，裕度 + cc 硬门）
+arrow_decode.py        生产解码 API（内孔默认，边缘可选，裕度 + cc 硬门）
 gen_plate.py           生成印版（单张 / 批量 / 两种载体）
 verify_decode.py       单张解码 + 核验图 + 验真模式
 batch_decode.py        批量解码（扫目录 / CSV / 批量出图）
@@ -271,8 +274,8 @@ samples/               样张与插图
 
 - **容量由边缘长度决定**，不是面积。2200 px 宽的 Logo 有效边缘约 2000 px，70 bit 就是每 bit 28 px。想多写只能加大调制幅度（视觉更明显）或换更大的载体。
 - **极限档 60%**（内孔载体；边缘载体能到 74%，但外轮廓会留下波纹）是当前信噪比的边界。其中约一半失败来自配准、一半来自信号不足；后者受限于调制幅度，再加就破坏隐蔽性。
-- **拍摄建议**：距离 8–15 cm，让 Logo 占画面 1/3 以上，避开强反光（最主要的干扰源）。倾斜 30° 以内能自动矫正。`logo_scale` 低于 0.20 时生产门直接拒绝（`low_logo_scale`）。把小图在手机上放大再送进来不会补上没拍到的边缘波形。纸面折痕要躲开笔画。
-- **研究解码器对无码图仍会吐出一个号码**——判决器总要给出 0/1。生产入口 `arrow_decode.decode` 会拒掉它：裕度均值低于 1.8，或最弱一组低于 1.0，或第 0 组补零不是 `000`，或配准 cc 低于 0.85，或码字不是合法 11 位号码时，`accepted=False`、`status="rejected"`、`digits=None`。不要用 `ok` 或 `mean|conf|` 判断成功。HTTP 默认不返回 `candidate_digits`。
+- **拍摄建议**：距离 8–15 cm，让 Logo 占画面 1/3 以上，避开强反光（最主要的干扰源）。倾斜 30° 以内能自动矫正。`logo_scale` 低于 0.15 时生产门直接拒绝（`low_logo_scale`）。把小图在手机上放大再送进来不会补上没拍到的边缘波形。纸面折痕要躲开笔画。
+- **研究解码器对无码图仍会吐出一个号码**——判决器总要给出 0/1。生产入口 `arrow_decode.decode` 会拒掉它：裕度均值低于 1.8，或最弱一组低于 0.55，或第 0 组补零不是 `000`，或配准 cc 低于 0.85，或 `logo_scale` 低于 0.15，或码字不是合法 11 位号码时，`accepted=False`、`status="rejected"`、`digits=None`。不要用 `ok` 或 `mean|conf|` 判断成功。HTTP 默认不返回 `candidate_digits`。
 
 ## 理论出处
 

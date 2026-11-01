@@ -3,8 +3,8 @@
 The research decoders in ``arrow_wm`` / ``arrow_inner`` always emit a digit
 string once sync succeeds. This module is the integrator-facing wrapper:
 
-* default carrier is the edge watermark (``carrier="edge"``)
-* ``carrier="inner"`` selects the inner-hole carrier; its algorithm is unchanged
+* default carrier is the inner-hole watermark (``carrier="inner"``)
+* ``carrier="edge"`` selects the edge watermark for legacy plates; its algorithm is unchanged
 * a hard gate sets ``accepted=False`` and ``digits=None`` unless the readout
   clears the mean codeword-margin threshold, the per-group minimum margin,
   the group-0 pad (``000``), and, when ECC refinement is on, the registration
@@ -38,8 +38,8 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-# Production default. Inner stays selectable and is not tuned here.
-DEFAULT_CARRIER = "edge"
+# Production default. Edge stays selectable for legacy plates and is not tuned here.
+DEFAULT_CARRIER = "inner"
 CARRIERS = ("edge", "inner")
 
 # These cuts are z-scores of amplitude-normalized soft values (soft_n),
@@ -47,7 +47,7 @@ CARRIERS = ("edge", "inner")
 # Edge decode divides the matched-filter differential by π·depth before
 # the gap/std margin is computed. A global scale does not move the z-score,
 # so the numeric cuts stay put when depth changes; per-bit depth_scale would.
-# v2@6 was checked against the same 1.8 / 1.0 cuts (see README ablation).
+# v2@6 was checked against the 1.8 mean cut (see README ablation).
 # True codes still sit at or above ~2.0 and unmarked plates at or below ~1.4.
 # The 1.8 cut is a watermark-present gate, not a digit-correct gate.
 MARGIN_THRESHOLD = 1.8
@@ -56,11 +56,12 @@ MARGIN_THRESHOLD = 1.8
 # A single near-tie group can leave the mean above 1.8. Confidently wrong
 # groups (large gap on the wrong codeword) are not caught here; that needs
 # a payload CRC, which is out of scope.
-# The 1.0 cut was placed between correct accepts (margin_min >= 1.24 on the
-# pre-v2 ±6 px probe) and two wrong reads at 0.17 and 0.32. It is not a
-# pixel threshold. Recalibrate from a v2@6 --dump-pairs CSV if the layout
-# or the soft_n definition changes.
-MIN_GROUP_MARGIN = 1.0
+# The old 1.0 cut sat between clean-plate accepts (margin_min >= 1.24 on the
+# pre-v2 ±6 px probe) and two wrong reads at 0.17 and 0.32. A real inner
+# photo of 17701234567 reads that number with margin_min ≈ 0.604. The
+# near-tie smoke (one group at amplitude 0.04) stays near 0.325, so 0.55
+# still rejects that tie and the 0.17 / 0.32 wrong reads. Not a pixel cut.
+MIN_GROUP_MARGIN = 0.55
 
 # --suspect: absolute z is not enough. The closest one-digit neighbor is
 # Hamming distance 3, so ideal soft info still scores that neighbor at
@@ -76,13 +77,15 @@ PAD_BITS = (0, 0, 0)
 # The production gate treats that same cut as a hard reject.
 CC_THRESHOLD = 0.85
 
-# README shooting note: below ~0.2× the plate width the edge wave is a
-# fraction of a camera pixel (±6 px at scale 0.077 is ±0.46 px). Extreme
-# sims in this repo sit around 0.7–0.9, so the cut does not touch that bench.
+# At ~0.08× the plate width the wave is a fraction of a camera pixel
+# (±6 px at scale 0.077 is ±0.46 px). That documented tiny frame stays
+# rejected. Extreme sims in this repo sit around 0.7–0.9, so the cut does
+# not touch that bench. The inner photo 17701234567 is logo_scale ≈ 0.160
+# with a correct readout; 0.15 accepts it and still rejects 0.077.
 # A frame under the cut is rejected even when registration cc is high.
 # It does not relax the margin gates, and a larger digital upscale of the
 # same pixels is a different image that still has to clear margin / pad.
-LOGO_SCALE_MIN = 0.20
+LOGO_SCALE_MIN = 0.15
 
 ImageLike = Union[np.ndarray, str, os.PathLike]
 
@@ -521,7 +524,7 @@ def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
            window_pow: Optional[float] = None,
            use_ecc_refine: bool = True,
            verbose: bool = False) -> DecodeResult:
-    """Decode one image. Carrier defaults to ``"edge"``; pass ``"inner"`` to opt in.
+    """Decode one image. Carrier defaults to ``"inner"``; pass ``"edge"`` for legacy plates.
 
     On reject, ``accepted`` is False, ``status`` is ``"rejected"``, and
     ``digits`` is None. Do not promote ``candidate_digits`` or ``ok``.
