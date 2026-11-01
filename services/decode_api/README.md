@@ -1,0 +1,93 @@
+# ARROW 解码 HTTP 服务
+
+把仓库根目录的 `arrow_decode.Decoder` 包成一个小 HTTP 服务，给微信小程序和腾讯云 TI-ONE 在线服务用。算法和接受门都不在这里改：默认载体仍是边缘（`edge`），`inner` 只是显式选项。
+
+契约见 [docs/miniprogram-integration.md](../../docs/miniprogram-integration.md)。TI-ONE 上怎么挂、以及**不要动其他已有服务**，见 [TI-ONE.md](TI-ONE.md)。
+
+## 端口
+
+容器监听 **8501**。这是 TI-ONE 在线服务的 REST 默认端口，平台健康检查默认也打 8501。本地和镜像都用这个端口，避免控制台「端口」和进程不一致时探针一直失败。
+
+要用别的端口：环境变量 `PORT`，并且在 TI-ONE 服务配置里把「端口」设成同一个数。不要用 8500（gRPC）或保留端口 8502–8510、6006、9092。
+
+## 本地运行
+
+在仓库根目录：
+
+```bash
+pip install -r requirements.txt
+python -m uvicorn services.decode_api.app:app --host 127.0.0.1 --port 8501
+```
+
+也可以在服务目录里启动。`app.py` 会把仓库根加进 `sys.path`，不依赖当前工作目录：
+
+```bash
+cd services/decode_api
+python -m uvicorn app:app --host 127.0.0.1 --port 8501
+```
+
+进程起来后会先加载边缘和内孔两个 `Decoder`（SIFT 模板）。日志出现 `[decode_api] ready` 之后 `/health` 才会通。只预热边缘可以设 `DECODE_WARMUP=edge`。
+
+健康检查：
+
+```bash
+curl -s http://127.0.0.1:8501/health
+```
+
+期望：`{"status":"ok"}`。
+
+解码（字段名用 `image`；`file` / `img` / `photo` / `picture` 也能认）。默认载体是 `edge`：
+
+```bash
+curl -s -F "image=@samples/edge/ARROW_13800138000.png" \
+  http://127.0.0.1:8501/decode
+```
+
+指定内孔，查询参数和表单字段都可以，查询参数优先：
+
+```bash
+curl -s -F "image=@samples/inner/ARROW_13800138000.png" \
+  "http://127.0.0.1:8501/decode?carrier=inner"
+
+curl -s -F "image=@photo.jpg" -F "carrier=edge" \
+  http://127.0.0.1:8501/decode
+```
+
+成功时 JSON 里 `accepted` 为 `true`，`digits` 是 11 位号码，`reason_text` 为「接受」。拒绝时 `accepted` 为 `false`，`digits` 为 `null`，用 `reason` / `reason_text` 提示用户。`candidate_digits` 只是诊断读数，**不能当号码显示**。
+
+无码对照应被拒绝（`digits` 为 `null`）：
+
+```bash
+curl -s -F "image=@samples/edge/ARROW_无码对照.png" \
+  http://127.0.0.1:8501/decode
+```
+
+## 可选鉴权
+
+环境变量 `DECODE_TOKEN` **未设置或为空**时不鉴权，方便本地调试。设置之后，只有请求头 `X-Decode-Token` 与它完全一致时 `POST /decode` 才通过；否则 `401`，正文 `{"detail":"unauthorized"}`。`GET /health` 始终不鉴权，给 TI-ONE 探针用。
+
+不要把令牌写进仓库或镜像。本地临时试：
+
+```bash
+DECODE_TOKEN=devsecret python -m uvicorn services.decode_api.app:app \
+  --host 127.0.0.1 --port 8501
+
+curl -s -H "X-Decode-Token: devsecret" \
+  -F "image=@samples/edge/ARROW_13800138000.png" \
+  http://127.0.0.1:8501/decode
+```
+
+TI-ONE 控制台自己的「服务鉴权」（`Authorization`）是另一层，和这个头互不替代。两层都开时，小程序要两个头都带。
+
+## 镜像
+
+在仓库根目录构建（上下文必须是仓库根，母版 PNG 和 `arrow_wm.py` 要在同一层）：
+
+```bash
+docker build -f services/decode_api/Dockerfile -t arrow-decode-api .
+docker run --rm -p 8501:8501 arrow-decode-api
+```
+
+镜像里只装 `services/decode_api/requirements.txt`（numpy、opencv-python-headless、fastapi、uvicorn、python-multipart），不装 matplotlib。启动命令是单 worker 的 uvicorn，监听 `0.0.0.0:${PORT:-8501}`。
+
+同一进程内解码是串行的。不要把 `--workers` 加大来赌吞吐：每个进程都会再加载一套模板。

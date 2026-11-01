@@ -5,3 +5,10 @@ opencv-python-headless
 # Figure scripts (verify_decode, benches). Not imported by arrow_decode.
 matplotlib
 pillow
+# HTTP service and the contract smoke in ci_smoke.py.
+# The TI-ONE image installs services/decode_api/requirements.txt instead
+# (no matplotlib, pillow, or httpx).
+fastapi
+uvicorn
+python-multipart
+httpx
