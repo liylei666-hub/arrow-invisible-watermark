@@ -57,5 +57,7 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8501'), timeout=4)"
 
-# One worker: each process holds its own decoder, and decodes are serialized.
-CMD ["sh", "-c", "exec python -m uvicorn services.decode_api.app:app --host 0.0.0.0 --port ${PORT:-8501} --workers 1"]
+# 进程内解码由一把锁串行（OpenCV matcher 不做重入保证），所以单 worker 的
+# 吞吐上限约 1/解码耗时。要多核并行就设 WEB_CONCURRENCY=N：每个 worker 进程
+# 各自持有完整解码器，内存约为单进程的 N 倍。默认 1 与原行为一致。
+CMD ["sh", "-c", "exec python -m uvicorn services.decode_api.app:app --host 0.0.0.0 --port ${PORT:-8501} --workers ${WEB_CONCURRENCY:-1}"]

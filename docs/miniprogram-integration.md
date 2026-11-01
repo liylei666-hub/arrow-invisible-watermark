@@ -62,7 +62,7 @@ multipart 的约定：
 | `low_group_margin` | 单组裕度不足 |
 | `pad_mismatch` | 补零不符 |
 | `low_cc` | 配准 cc 不足 |
-| `low_logo_scale` | 请靠近重拍 |
+| `low_logo_scale` | 画面中 Logo 过小 |
 | `invalid_payload` | 码字越界 |
 | `unreadable` | 读不到图像 |
 | `sync_failed` | 同步失败 |

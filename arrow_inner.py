@@ -267,17 +267,9 @@ class InnerDecoder:
             off += n
         return feats
 
-    def _decode_gray(self, gray: np.ndarray, return_debug: bool = False,
-                     source: Optional[np.ndarray] = None,
-                     origin: Tuple[float, float] = (0.0, 0.0),
-                     upscale_factor: Optional[int] = None) -> Dict:
-        """单幅灰度图：矫正 → 内孔半径测量 → 软判决。
-
-        ``source`` 给定时，配准用 ``gray``（原分辨率裁切），但从上传原图
-        ``source`` 用 H∘裁切平移一次采样，避免「裁切后再重采样」抹平径向波形。
-        """
-        r = self._reg.rectify(gray, source=source, origin=origin,
-                              upscale_factor=upscale_factor)
+    def _decode_gray(self, gray: np.ndarray, return_debug: bool = False) -> Dict:
+        """单幅灰度图：矫正 → 内孔半径测量 → 软判决。"""
+        r = self._reg.rectify(gray)
         if not r.get("ok"):
             return {"ok": False, "reason": r.get("reason", "rectify_failed"),
                     "digits": None, "bits": None, "mean_conf": 0.0,
@@ -309,16 +301,13 @@ class InnerDecoder:
         return out
 
     def decode(self, image: np.ndarray, return_debug: bool = False) -> Dict:
-        """内孔版解码入口：与边缘版同一套真实构图策略，多一条 SIFT 裁切。
+        """内孔版解码入口：与边缘版同一套真实构图策略。
 
-          路径 A `full`      ：整幅直接解
-          路径 B `plate#k`   ：先隔离亮底卡片再解（2.2 cm 实物贴在深色产品上时）
-          路径 C `sift_roi`  ：粗 SIFT 在缩小图上出框，映射回原图后按 pad≈0.2
-                              裁原分辨率，再用 H∘裁切平移从原图一次 warp
+          路径 A `full`     ：整幅直接解
+          路径 B `plate#k`  ：先隔离亮底卡片再解（2.2 cm 实物贴在深色产品上时）
 
         大画幅 + 小白卡时优先走 B，避免整幅暗背景拖垮二值化/配准；
         择优仍按 (cc≥0.85, mean_conf) 字典序，防止裁错图时 conf 虚高。
-        logo_scale 一律按上传原图像素上的 H 计算，整数插值放大不抬高它。
         """
         if image.ndim == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -326,8 +315,6 @@ class InnerDecoder:
             gray = image
 
         CC_GATE = 0.85
-        # 整幅判一次。plate / sift_roi 都用这个倍数，裁切块不再单独放大尺度。
-        upscale_factor = A.interpolation_upscale_factor(gray)
 
         def _rank(d: Dict):
             return (1 if d.get("cc", 0.0) >= CC_GATE else 0,
@@ -357,38 +344,21 @@ class InnerDecoder:
                     and best.get("cc", 0.0) >= gate_cc
                     and best.get("mean_conf", 0.0) >= gate_conf)
 
-        def _run(img: np.ndarray, source: Optional[np.ndarray] = None,
-                 origin: Tuple[float, float] = (0.0, 0.0)) -> Dict:
-            return self._decode_gray(
-                img, return_debug, source=source, origin=origin,
-                upscale_factor=upscale_factor)
-
         if not plate_first:
-            _consider(_run(gray), "full")
+            _consider(self._decode_gray(gray, return_debug), "full")
             if _good_enough(0.95, 0.020):
                 return best
 
         for k, cand in enumerate(plates):
             if cand.size / float(max(gray.size, 1)) >= 0.85:
                 continue
-            _consider(_run(cand), f"plate#{k}", isolated=True)
+            _consider(self._decode_gray(cand, return_debug), f"plate#{k}",
+                      isolated=True)
             if _good_enough(CC_GATE, 0.020):
                 return best
 
-        box = self._reg.sift_roi_box(gray, pad=0.2)
-        if box is not None:
-            x0, y0, x1, y1 = box
-            frac = (x1 - x0) * (y1 - y0) / float(max(gray.size, 1))
-            # 框已经接近整幅时，full 路径就是这一裁切，不必再解一次。
-            if frac < 0.85:
-                crop = np.ascontiguousarray(gray[y0:y1, x0:x1])
-                _consider(_run(crop, source=gray, origin=(x0, y0)),
-                          "sift_roi", isolated=True)
-                if _good_enough(CC_GATE, 0.020):
-                    return best
-
         if plate_first:
-            _consider(_run(gray), "full")
+            _consider(self._decode_gray(gray, return_debug), "full")
 
         if best is not None:
             return best

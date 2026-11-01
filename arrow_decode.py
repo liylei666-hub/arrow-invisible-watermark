@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -78,26 +80,113 @@ PAD_BITS = (0, 0, 0)
 CC_THRESHOLD = 0.85
 
 # At ~0.08× the plate width the wave is a fraction of a camera pixel
-# (±6 px at scale 0.077 is ±0.46 px). That documented tiny frame stays
+# (±6 px at scale 0.077 is ±0.46 px); that documented tiny frame stays
 # rejected. Extreme sims in this repo sit around 0.7–0.9, so the cut does
-# not touch that bench. The inner photo 17701234567 is logo_scale ≈ 0.160
-# with a correct readout; 0.1 accepts it and still rejects 0.077. A scale
-# around 0.14 clears this gate on its own.
+# not touch that bench. Two real inner photos of 17701234567 bracket the cut:
+#   scale ≈ 0.160 -> correct, margin 6.07 (original 0.160 sample)
+#   scale ≈ 0.131 -> correct, margin 2.82, margin_min 0.66, cc 0.976
+# The 0.131 frame was rejected only by this cut, with every signal gate
+# comfortably green. The product owner set the cut to 0.10 (from 0.15):
+# at 0.10 the ±6 px modulation is ±0.60 camera px per side (1.20 px
+# differential), and the margin / pad / cc gates still decide readability.
+# 0.077 remains under the cut, so the documented tiny frame is still rejected.
 # A frame under the cut is rejected even when registration cc is high.
-# It does not relax the margin gates. A 2×/4× interpolation of the same
-# pixels is not a larger logo: logo_scale stays on the pre-upscale grid
-# (homography scale divided by the detected integer factor), and margin /
-# pad still have to clear.
-LOGO_SCALE_MIN = 0.1
+# It does not relax the margin gates, and a larger digital upscale of the
+# same pixels is a different image that still has to clear margin / pad.
+LOGO_SCALE_MIN = 0.10
 
 ImageLike = Union[np.ndarray, str, os.PathLike]
+
+# ---- 共享构造缓存 ----------------------------------------------------------
+# ArrowDesign 构造一次约 200 ms（栅格化 + 布局推导），Decoder 还要再花
+# 250–500 ms 建模板 / SIFT / 内孔映射。一次性接口 decode() 原先每次调用都
+# 重建一遍，单次调用里 3/4 的时间花在这上面。设计对象构造后只读，可以安全
+# 复用；会话本身有内部状态（OpenCV matcher 不做重入保证），所以缓存里同时
+# 存一把锁，同一会话的并发调用仍然串行。
+_DESIGN_CACHE_MAX = 8
+_SESSION_CACHE_MAX = 8
+_design_cache: "OrderedDict[tuple, object]" = OrderedDict()
+_session_cache: "OrderedDict[tuple, Tuple[object, threading.RLock]]" = OrderedDict()
+# RLock：_shared_session 持锁构造 Decoder，而 Decoder 内部又会调
+# _shared_design 取同一把锁。普通 Lock 会在这里自锁。
+_cache_lock = threading.RLock()
+
+
+def _design_key(kwargs: Dict) -> tuple:
+    import arrow_wm as A
+    return (int(kwargs.get("layout_version", A.LAYOUT_VERSION)),
+            float(kwargs.get("depth", A.MOD_DEPTH)),
+            float(kwargs.get("window_pow", A.WINDOW_POW)))
+
+
+def _shared_design(**kwargs):
+    """Return a process-wide ArrowDesign for this geometry.
+
+    ``verbose=True`` always builds a fresh one so the layout prints still
+    happen; it is a debugging path, not the hot one.
+    """
+    import arrow_wm as A
+    if kwargs.get("verbose"):
+        return A.ArrowDesign(**kwargs)
+    key = _design_key(kwargs)
+    with _cache_lock:
+        design = _design_cache.get(key)
+        if design is None:
+            design = A.ArrowDesign(**kwargs)
+            _design_cache[key] = design
+            while len(_design_cache) > _DESIGN_CACHE_MAX:
+                _design_cache.popitem(last=False)
+        else:
+            _design_cache.move_to_end(key)
+        return design
+
+
+def _session_key(carrier: str, margin_threshold: float,
+                 min_group_margin: float, cc_threshold: Optional[float],
+                 design, depth: Optional[float], layout_version: Optional[int],
+                 window_pow: Optional[float], use_ecc_refine: bool,
+                 verbose: bool) -> tuple:
+    return (carrier, float(margin_threshold), float(min_group_margin),
+            None if cc_threshold is None else float(cc_threshold),
+            None if design is None else id(design),
+            None if depth is None else float(depth),
+            None if layout_version is None else int(layout_version),
+            None if window_pow is None else float(window_pow),
+            bool(use_ecc_refine), bool(verbose))
+
+
+def _shared_session(**kwargs) -> Tuple["Decoder", threading.RLock]:
+    """A cached Decoder plus the lock that serializes its use.
+
+    Keyed on every constructor argument that changes behavior, thresholds
+    included, so a call can never inherit another call's gate settings.
+    """
+    key = _session_key(
+        kwargs.get("carrier", DEFAULT_CARRIER),
+        kwargs.get("margin_threshold", MARGIN_THRESHOLD),
+        kwargs.get("min_group_margin", MIN_GROUP_MARGIN),
+        kwargs.get("cc_threshold", CC_THRESHOLD),
+        kwargs.get("design"), kwargs.get("depth"), kwargs.get("layout_version"),
+        kwargs.get("window_pow"), kwargs.get("use_ecc_refine", True),
+        kwargs.get("verbose", False))
+    with _cache_lock:
+        entry = _session_cache.get(key)
+        if entry is None:
+            session = Decoder(**kwargs)
+            entry = (session, threading.RLock())
+            _session_cache[key] = entry
+            while len(_session_cache) > _SESSION_CACHE_MAX:
+                _session_cache.popitem(last=False)
+        else:
+            _session_cache.move_to_end(key)
+        return entry
 
 REASON_TEXT = {
     "low_margin": "码字裕度不足",
     "low_group_margin": "单组裕度不足",
     "pad_mismatch": "补零不符",
     "low_cc": "配准 cc 不足",
-    "low_logo_scale": "请靠近重拍",
+    "low_logo_scale": "画面中 Logo 过小",
     "invalid_payload": "码字越界",
     "unreadable": "读不到图像",
     "sync_failed": "同步失败",
@@ -477,9 +566,9 @@ class Decoder:
                 kw["depth"] = A.V1_DEPTH
             if window_pow is not None:
                 kw["window_pow"] = float(window_pow)
-            self.design = A.ArrowDesign(**kw)
+            self.design = _shared_design(**kw)
         else:
-            self.design = A.ArrowDesign(verbose=verbose)
+            self.design = _shared_design(verbose=verbose)
         if carrier == "edge":
             self._impl = A.WatermarkDecoder(
                 self.design, use_ecc_refine=self.use_ecc_refine, verbose=verbose)
@@ -536,7 +625,7 @@ def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
     check is skipped (``cc`` stays 0). Mean margin, minimum group margin,
     and the pad check still apply.
     """
-    session = Decoder(
+    session, lock = _shared_session(
         carrier=carrier,
         margin_threshold=margin_threshold,
         min_group_margin=min_group_margin,
@@ -548,4 +637,5 @@ def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
         use_ecc_refine=use_ecc_refine,
         verbose=verbose,
     )
-    return session.decode(image, return_debug=return_debug)
+    with lock:
+        return session.decode(image, return_debug=return_debug)

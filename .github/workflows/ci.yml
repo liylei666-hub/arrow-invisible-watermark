@@ -15,7 +15,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            services/decode_api/requirements.txt
       - name: Install dependencies
         run: pip install -r requirements.txt
+      # 先单独查一次：失败信息直接指向同步脚本，比埋在 25 个冒烟用例里清楚。
+      - name: wxcloudrun vendor copy is in sync
+        run: python tools/sync_vendor.py --check
       - name: Embed/decode smoke and accept gate
         run: python ci_smoke.py

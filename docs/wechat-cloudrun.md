@@ -17,7 +17,14 @@ TI-ONE 那条线仍然看 [services/decode_api/TI-ONE.md](../services/decode_api
 | 推荐 | 留空（仓库根） | `Dockerfile` |
 | 备选 | `wxcloudrun` | `Dockerfile` |
 
-`wxcloudrun/` 里放了一份构建所需源码（`arrow_decode.py`、`arrow_wm.py`、`arrow_inner.py`、`ARROW_clean_pro.png`、`services/decode_api/app.py` 等），和仓库根是同一份内容。改解码或 HTTP 服务时两处一起改，否则 CI 失败。
+`wxcloudrun/` 里放了一份构建所需源码（`arrow_decode.py`、`arrow_wm.py`、`arrow_inner.py`、`ARROW_clean_pro.png`、`services/decode_api/app.py` 等），和仓库根是同一份内容。改完解码或 HTTP 服务后跑一次：
+
+```bash
+python tools/sync_vendor.py            # 把差异同步过去
+python tools/sync_vendor.py --check    # 只检查，CI 跑的就是这条
+```
+
+不要手工复制，漏文件的后果是线上镜像和仓库不一致。
 
 容器进程监听 **`0.0.0.0:8501`**（环境变量 `PORT` 未设置时）。`GET /health` 返回 `{"status":"ok"}`，不校验令牌。`POST /decode` 的 multipart 行为与原来一致。
 

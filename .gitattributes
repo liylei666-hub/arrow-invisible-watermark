@@ -1,0 +1,11 @@
+# 统一使用 LF。Windows 下若 checkout 成 CRLF，Dockerfile 会因
+# `FROM ...\r` 报 "unknown instruction"，且全仓库 diff 会被换行噪音淹没。
+* text=auto eol=lf
+
+# 二进制资产不做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.pdf binary

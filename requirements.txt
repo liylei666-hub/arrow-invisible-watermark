@@ -1,14 +1,17 @@
 # Runtime for the decode path and CI smoke.
 # opencv-python (GUI build) also works locally; CI uses the headless wheel.
-numpy
-opencv-python-headless
+# 版本给区间而不是留空：留空会让 CI 每次解析到当时的 latest，上游一次
+# 大版本升级就可能悄悄改变 resize / interpolation 的数值行为（布局黄金
+# 哈希、亚像素测量都对它敏感），而失败现场往往无法复现。
+numpy>=1.24,<3
+opencv-python-headless>=4.8,<6
 # Figure scripts (verify_decode, benches). Not imported by arrow_decode.
-matplotlib
-pillow
+matplotlib>=3.7,<4
+pillow>=10,<13
 # HTTP service and the contract smoke in ci_smoke.py.
 # The TI-ONE image installs services/decode_api/requirements.txt instead
 # (no matplotlib, pillow, or httpx).
-fastapi
-uvicorn
-python-multipart
-httpx
+fastapi>=0.110,<1
+uvicorn>=0.27,<1
+python-multipart>=0.0.9,<1
+httpx>=0.27,<1

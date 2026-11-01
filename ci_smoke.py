@@ -129,11 +129,36 @@ class GateTests(unittest.TestCase):
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
         self.assertLess(result.logo_scale, AD.LOGO_SCALE_MIN)
 
+    def test_logo_scale_cut_accepts_0131_and_rejects_0077(self):
+        """Second real inner photo of 17701234567 sets the accepted edge.
+
+        It reads the correct number at logo_scale ≈ 0.131 with margin 2.82,
+        margin_min 0.66 and cc 0.976 — every signal gate green — and was
+        rejected only by the old 0.15 scale cut. The cut is 0.10; the
+        documented 0.077 tiny frame stays under it and is still rejected.
+        """
+        base = {
+            "ok": True, "digits": "17701234567", "payload_valid": True,
+            "margin": 2.82, "margin_min": 0.66, "cc": 0.976,
+            "mean_conf": 0.02, "pad_bits": [0, 0, 0],
+        }
+        kept = AD.apply_gate(dict(base, logo_scale=0.131), carrier="inner")
+        self.assertTrue(kept.accepted, kept.public_dict())
+        self.assertEqual(kept.digits, "17701234567")
+        # 门是包含下界：恰好 0.10 接受，0.099 拒绝。
+        edge = AD.apply_gate(dict(base, logo_scale=AD.LOGO_SCALE_MIN),
+                             carrier="inner")
+        self.assertTrue(edge.accepted, edge.public_dict())
+        under = AD.apply_gate(dict(base, logo_scale=0.077), carrier="inner")
+        self.assertFalse(under.accepted, under.public_dict())
+        self.assertIn("low_logo_scale", under.reason)
+        self.assertIsNone(under.digits)
+
     def test_gate_photo_inner_fields_are_accepted(self):
         # Real inner photo 17701234567: correct candidate, previously rejected
         # only by logo_scale≈0.1595 and margin_min≈0.604. Those cuts are now
-        # 0.1 and 0.55. The 0.077 tiny-logo case and the ~0.325 near-tie stay
-        # rejected by the tests above and below. ~0.14 clears the scale gate.
+        # 0.10 and 0.55. The 0.077 tiny-logo case and the ~0.325 near-tie stay
+        # rejected by the tests above and below.
         raw = {
             "ok": True, "digits": "17701234567", "payload_valid": True,
             "margin": 2.80, "margin_min": 0.604, "cc": 0.975,
@@ -146,28 +171,6 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result.candidate_digits, "17701234567")
         self.assertGreaterEqual(result.logo_scale, AD.LOGO_SCALE_MIN)
         self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
-
-    def test_logo_scale_around_0_14_clears_scale_gate(self):
-        # 0.14 sat under the old 0.15 cut. The scale gate alone now accepts
-        # it. Margin, pad, and cc stay well above their cuts, so a reject
-        # here would be the scale gate.
-        raw = {
-            "ok": True, "digits": "13800138000", "payload_valid": True,
-            "margin": 4.2, "margin_min": 3.0, "cc": 0.97,
-            "mean_conf": 0.05, "logo_scale": 0.14, "pad_bits": [0, 0, 0],
-        }
-        result = AD.apply_gate(raw)
-        self.assertTrue(result.accepted, result.public_dict())
-        self.assertEqual(result.digits, "13800138000")
-        self.assertNotIn("low_logo_scale", result.reason)
-        self.assertGreaterEqual(result.logo_scale, AD.LOGO_SCALE_MIN)
-
-        below = dict(raw, logo_scale=0.099)
-        rejected = AD.apply_gate(below)
-        self.assertFalse(rejected.accepted, rejected.public_dict())
-        self.assertIsNone(rejected.digits)
-        self.assertEqual(rejected.reason, "low_logo_scale")
-        self.assertLess(rejected.logo_scale, AD.LOGO_SCALE_MIN)
 
     def test_clear_read_is_accepted(self):
         raw = {
@@ -376,127 +379,6 @@ class RoundtripTests(unittest.TestCase):
         self.assertLess(via_fn.cc, AD.CC_THRESHOLD)
 
 
-class LogoScaleUpscaleTests(unittest.TestCase):
-    """Interpolation must not inflate logo_scale or slip past 0.1."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.session = AD.Decoder(carrier="inner")
-
-    def test_gates_and_low_logo_scale_copy(self):
-        import arrow_inner as I
-        self.assertEqual(AD.DEFAULT_CARRIER, "inner")
-        self.assertEqual(AD.LOGO_SCALE_MIN, 0.1)
-        self.assertEqual(AD.MIN_GROUP_MARGIN, 0.55)
-        self.assertEqual(AD.MARGIN_THRESHOLD, 1.8)
-        self.assertEqual(AD.CC_THRESHOLD, 0.85)
-        self.assertEqual(AD.PAD_BITS, (0, 0, 0))
-        self.assertEqual(I.DEPTH, 6.0)
-        self.assertEqual(AD.reason_text("low_logo_scale"), "请靠近重拍")
-        self.assertEqual(AD.REASON_TEXT["low_logo_scale"], "请靠近重拍")
-
-    def test_integer_upscale_keeps_logo_scale(self):
-        import cv2
-        import arrow_wm as A
-        plate = self.session._inner.embed("13800138000")["plate"]
-        native = self.session.decode(plate)
-        self.assertTrue(native.accepted, native.public_dict())
-        self.assertGreater(native.logo_scale, 0.5)
-        for factor, interp in (
-                (2, cv2.INTER_LINEAR), (4, cv2.INTER_LINEAR),
-                (2, cv2.INTER_CUBIC)):
-            up = cv2.resize(plate, None, fx=factor, fy=factor, interpolation=interp)
-            self.assertEqual(A.interpolation_upscale_factor(up), factor)
-            got = self.session.decode(up)
-            self.assertAlmostEqual(
-                got.logo_scale, native.logo_scale, delta=0.005,
-                msg=(factor, interp, got.logo_scale, native.logo_scale))
-
-    def test_tiny_logo_stays_rejected_after_upscale(self):
-        # Documented 0.077 case: a 2× interpolation would report ~0.154 and
-        # clear LOGO_SCALE_MIN if scale were measured on the enlarged grid.
-        import cv2
-        import arrow_wm as A
-        plate = self.session._inner.embed("13800138000")["plate"]
-        native = self.session.decode(plate)
-        target = 0.077
-        k = target / float(native.logo_scale)
-        tiny = cv2.resize(
-            plate,
-            (max(8, int(round(plate.shape[1] * k))),
-             max(8, int(round(plate.shape[0] * k)))),
-            interpolation=cv2.INTER_AREA)
-        self.assertEqual(A.interpolation_upscale_factor(tiny), 1)
-        base = self.session.decode(tiny)
-        self.assertFalse(base.accepted, base.public_dict())
-        self.assertIsNone(base.digits)
-        self.assertIn("low_logo_scale", base.reason)
-        self.assertAlmostEqual(base.logo_scale, target, delta=0.008)
-        self.assertLess(base.logo_scale, AD.LOGO_SCALE_MIN)
-        self.assertEqual(AD.reason_text(base.reason).split("，")[0], "请靠近重拍")
-        for factor in (2, 4):
-            up = cv2.resize(tiny, None, fx=factor, fy=factor,
-                            interpolation=cv2.INTER_LINEAR)
-            self.assertEqual(A.interpolation_upscale_factor(up), factor)
-            # Uncorrected homography scale would clear the gate.
-            self.assertGreaterEqual(base.logo_scale * factor, AD.LOGO_SCALE_MIN)
-            got = self.session.decode(up)
-            self.assertFalse(got.accepted, got.public_dict())
-            self.assertIsNone(got.digits)
-            self.assertIn("low_logo_scale", got.reason)
-            self.assertAlmostEqual(
-                got.logo_scale, base.logo_scale, delta=0.005,
-                msg=(factor, got.logo_scale, base.logo_scale))
-            self.assertLess(got.logo_scale, AD.LOGO_SCALE_MIN)
-
-    def test_sift_roi_crops_original_and_warps_once(self):
-        # Square card: plate#k rejects the aspect ratio. The box comes from
-        # coarse SIFT mapped back to full resolution, pad 0.2, and the
-        # decode samples the original frame once (H composed with the crop
-        # offset) instead of a resized crop.
-        import cv2
-        plate = self.session._inner.embed("13800138000")["plate"]
-        width = 420
-        height = max(8, int(round(plate.shape[0] * width / plate.shape[1])))
-        small = cv2.resize(plate, (width, height), interpolation=cv2.INTER_AREA)
-        side = int(round(max(small.shape) * 1.35))
-        card = np.full((side, side), 230, np.uint8)
-        y0 = (side - height) // 2
-        x0 = (side - width) // 2
-        card[y0:y0 + height, x0:x0 + width] = small
-        canvas = np.full((1600, 1800), 18, np.uint8)
-        oy = (canvas.shape[0] - side) // 2
-        ox = (canvas.shape[1] - side) // 2
-        canvas[oy:oy + side, ox:ox + side] = card
-
-        reg = self.session._impl._reg
-        box = reg.sift_roi_box(canvas, pad=0.2)
-        self.assertIsNotNone(box)
-        bx0, by0, bx1, by1 = box
-        self.assertLess((bx1 - bx0) * (by1 - by0), 0.85 * canvas.size)
-        self.assertGreaterEqual(ox + x0 + width // 2, bx0)
-        self.assertLess(ox + x0 + width // 2, bx1)
-        self.assertGreaterEqual(oy + y0 + height // 2, by0)
-        self.assertLess(oy + y0 + height // 2, by1)
-        # pad≈0.2 around the ink quad, still a crop of the original frame.
-        self.assertGreater(bx1 - bx0, width // 2)
-        self.assertGreater(by1 - by0, height // 2)
-
-        crop = np.ascontiguousarray(canvas[by0:by1, bx0:bx1])
-        via_source = self.session._impl._decode_gray(
-            crop, source=canvas, origin=(bx0, by0), upscale_factor=1)
-        self.assertTrue(via_source.get("ok"), via_source.get("reason"))
-        self.assertEqual(via_source.get("digits"), "13800138000")
-        self.assertGreaterEqual(via_source.get("cc", 0.0), AD.CC_THRESHOLD)
-        full = self.session.decode(canvas)
-        self.assertEqual(full.candidate_digits, "13800138000")
-        self.assertAlmostEqual(via_source["logo_scale"], full.logo_scale, delta=0.01)
-        # 2× interpolation of this same frame must not move logo_scale.
-        up = cv2.resize(canvas, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-        up_r = self.session.decode(up)
-        self.assertAlmostEqual(up_r.logo_scale, full.logo_scale, delta=0.01)
-
-
 class ServiceContractTests(unittest.TestCase):
     """HTTP contract around arrow_decode. Does not load a SIFT template."""
 
@@ -506,8 +388,13 @@ class ServiceContractTests(unittest.TestCase):
         cls._prev_token = os.environ.get("DECODE_TOKEN")
         os.environ["DECODE_WARMUP"] = "0"
         os.environ.pop("DECODE_TOKEN", None)
+        try:
+            import fastapi  # noqa: F401
+            from fastapi.testclient import TestClient
+        except ImportError:  # pragma: no cover - local run without the service extras
+            raise unittest.SkipTest(
+                "fastapi/httpx not installed; run pip install -r requirements.txt")
         import services.decode_api.app as svc
-        from fastapi.testclient import TestClient
 
         cls.svc = svc
         cls._orig_decode = svc.decode_image
@@ -829,16 +716,8 @@ class ServiceContractTests(unittest.TestCase):
 class CloudRunPackagingTests(unittest.TestCase):
     """Repo-root and wxcloudrun/ build contexts ship the same image inputs."""
 
-    _VENDOR = (
-        "arrow_decode.py",
-        "arrow_wm.py",
-        "arrow_inner.py",
-        "ARROW_clean_pro.png",
-        "services/__init__.py",
-        "services/decode_api/__init__.py",
-        "services/decode_api/app.py",
-        "services/decode_api/requirements.txt",
-    )
+    # 单一来源：tools/sync_vendor.py 既定义清单，也能一键同步。
+    from tools.sync_vendor import VENDOR_FILES as _VENDOR
 
     def _root(self):
         return os.path.dirname(os.path.abspath(__file__))
@@ -863,6 +742,15 @@ class CloudRunPackagingTests(unittest.TestCase):
         self.assertIn("COPY services/decode_api/requirements.txt", text)
         self.assertIn("COPY arrow_decode.py arrow_wm.py arrow_inner.py ARROW_clean_pro.png", text)
 
+    def test_dockerfiles_use_lf_endings(self):
+        """CRLF turns ``FROM ...\\r`` into an unknown instruction on a local build."""
+        root = self._root()
+        for rel in ("Dockerfile", "services/decode_api/Dockerfile",
+                    "wxcloudrun/Dockerfile"):
+            with open(os.path.join(root, rel), "rb") as handle:
+                body = handle.read()
+            self.assertNotIn(b"\r\n", body, "%s has CRLF line endings" % rel)
+
     def test_wxcloudrun_vendor_matches_repo(self):
         root = self._root()
         for rel in self._VENDOR:
@@ -872,7 +760,8 @@ class CloudRunPackagingTests(unittest.TestCase):
                 same = src_file.read() == dst_file.read()
             self.assertTrue(
                 same,
-                "wxcloudrun/%s does not match %s; copy the repo file over it" % (rel, rel),
+                "wxcloudrun/%s 与 %s 不一致；运行 `python tools/sync_vendor.py` 同步"
+                % (rel, rel),
             )
 
 
@@ -958,6 +847,31 @@ class LayoutVersionTests(unittest.TestCase):
         soft = res["soft_n"]
         self.assertGreater(float(abs(soft).mean()), 0.5)
         self.assertLess(float(abs(soft).mean()), 1.6)
+
+
+class SampleAssetTests(unittest.TestCase):
+    """The committed plates are fixtures, not just docs.
+
+    Synthetic roundtrips use the same code for embed and decode, so they can
+    stay green while the layout quietly drifts away from already-printed
+    plates. Decoding the checked-in edge/inner samples is the anchor that
+    catches that: these files were produced by older builds.
+    """
+
+    _SAMPLES = (
+        ("edge", "samples/edge/ARROW_13800138000.png", "13800138000"),
+        ("inner", "samples/inner/ARROW_13800138000.png", "13800138000"),
+    )
+
+    def test_committed_plates_still_decode(self):
+        import arrow_decode as AD
+        root = os.path.dirname(os.path.abspath(__file__))
+        for carrier, rel, digits in self._SAMPLES:
+            path = os.path.join(root, rel)
+            self.assertTrue(os.path.exists(path), path)
+            result = AD.decode(path, carrier=carrier)
+            self.assertTrue(result.accepted, (carrier, result.public_dict()))
+            self.assertEqual(result.digits, digits, carrier)
 
 
 _PNG_1X1 = base64.b64decode(

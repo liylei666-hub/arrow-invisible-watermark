@@ -1,8 +1,10 @@
 # Runtime for the decode HTTP service and its TI-ONE image.
-# numpy + opencv-python-headless match the repo root. matplotlib and pillow
-# are figure-script dependencies and are not imported by arrow_decode.
-numpy
-opencv-python-headless
-fastapi
-uvicorn
-python-multipart
+# numpy + opencv-python-headless match the repo root.
+# matplotlib and pillow are figure-script dependencies and are not imported
+# by arrow_decode, so they are deliberately absent from this image.
+# 版本区间理由见仓库根 requirements.txt：不钉死会随上游大版本漂移。
+numpy>=1.24,<3
+opencv-python-headless>=4.8,<6
+fastapi>=0.110,<1
+uvicorn>=0.27,<1
+python-multipart>=0.0.9,<1

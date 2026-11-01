@@ -109,6 +109,6 @@ docker build -t arrow-decode-api wxcloudrun
 docker run --rm -p 8501:8501 arrow-decode-api
 ```
 
-`wxcloudrun/` 里的源码是仓库根那几份的副本（母版 PNG、`arrow_wm.py`、HTTP 服务）。CI 要求两边一致。镜像里只装 `services/decode_api/requirements.txt`（numpy、opencv-python-headless、fastapi、uvicorn、python-multipart），不装 matplotlib。启动命令是单 worker 的 uvicorn，监听 `0.0.0.0:${PORT:-8501}`。
+`wxcloudrun/` 里的源码是仓库根那几份的副本（母版 PNG、`arrow_wm.py`、HTTP 服务）。改完主仓库后跑 `python tools/sync_vendor.py`，CI 会用 `--check` 验证两边一致。镜像里只装 `services/decode_api/requirements.txt`（numpy、opencv-python-headless、fastapi、uvicorn、python-multipart），不装 matplotlib。启动命令监听 `0.0.0.0:${PORT:-8501}`。
 
-同一进程内解码是串行的。不要把 `--workers` 加大来赌吞吐：每个进程都会再加载一套模板。
+同一进程内解码由一把锁串行（OpenCV matcher 不做重入保证），单 worker 的吞吐上限约等于 1/解码耗时。需要多核并行时设 `WEB_CONCURRENCY=N` 起多个 worker：每个进程会各自加载一套模板和解码器，内存约为单进程的 N 倍，默认 1 与原行为一致。
