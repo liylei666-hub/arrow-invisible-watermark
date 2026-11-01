@@ -337,7 +337,10 @@ class RoundtripTests(unittest.TestCase):
         self.assertEqual(result.digits, self.digits)
         self.assertGreaterEqual(result.margin, AD.MARGIN_THRESHOLD)
         self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
-        self.assertEqual(result.raw.get("pad_bits"), [0, 0, 0])
+        # 默认新印版是 v3：CRC-7 取代固定补零。
+        self.assertEqual(result.raw.get("layout_version"), I.LAYOUT_V3)
+        self.assertTrue(result.raw.get("crc_ok"))
+        self.assertIsNone(result.raw.get("pad_bits"))
         self.assertGreaterEqual(result.cc, AD.CC_THRESHOLD)
 
     def test_no_ecc_clean_accepts_unmarked_rejects_on_margin(self):
@@ -835,7 +838,8 @@ class LayoutVersionTests(unittest.TestCase):
         inner = I.InnerCarrier(self.v2, verbose=False)
         inner_plate = inner.embed(digits)
         self.assertEqual(inner_plate["digits"], digits)
-        self.assertEqual(len(inner.cells), self.A.N_CELLS)
+        self.assertEqual(len(inner.cells), I.N_CELLS_V3)
+        self.assertEqual(inner.layout_version, I.LAYOUT_V3)
 
     def test_clean_soft_n_is_order_one(self):
         digits = "13800138000"
@@ -847,6 +851,69 @@ class LayoutVersionTests(unittest.TestCase):
         soft = res["soft_n"]
         self.assertGreater(float(abs(soft).mean()), 0.5)
         self.assertLess(float(abs(soft).mean()), 1.6)
+
+
+class InnerV3Tests(unittest.TestCase):
+    """v3: 154 码元、11 组交织、CRC-7 取代固定补零。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import arrow_inner as I
+        import arrow_wm as A
+        cls.I = I
+        cls.A = A
+        cls.design = A.ArrowDesign(verbose=False)
+
+    def test_codec_roundtrip_corrects_one_bit(self):
+        I = self.I
+        bits = I.encode_payload_v3("17701234567")
+        self.assertEqual(len(bits), I.N_BITS_V3)
+        soft = [1.0 if b else -1.0 for b in bits]
+        digits, crc_ok, changed = I.decode_payload_v3_soft(soft)
+        self.assertEqual(digits, "17701234567")
+        self.assertTrue(crc_ok)
+        self.assertEqual(changed, 0)
+        soft[3] *= -1.0            # 每组可纠 1 位，CRC 仍应通过
+        digits, crc_ok, _ = I.decode_payload_v3_soft(soft)
+        self.assertEqual(digits, "17701234567")
+        self.assertTrue(crc_ok)
+
+    def test_each_hamming_group_spans_three_holes(self):
+        I = self.I
+        carrier = I.InnerCarrier(self.design, verbose=False,
+                                 layout_version=I.LAYOUT_V3)
+        flat_to_pair = {}
+        off = 0
+        for hi, h in enumerate(carrier.holes):
+            for k in range(h["n_cells"] // 2):
+                flat_to_pair[off + k] = (hi, k)
+            off += h["n_cells"] // 2
+        for g in range(I.N_BITS_V3 // 7):
+            holes = {flat_to_pair[carrier.pair_order[b]][0]
+                     for b in range(7 * g, 7 * g + 7)}
+            self.assertGreaterEqual(len(holes), 3, (g, holes))
+
+    def test_auto_reads_both_plate_layouts(self):
+        I = self.I
+        session = AD.Decoder(carrier="inner", design=self.design)
+        for layout in (I.LAYOUT_V2, I.LAYOUT_V3):
+            plate = I.InnerCarrier(self.design, verbose=False,
+                                   layout_version=layout).embed("13912345678")["plate"]
+            result = session.decode(plate)
+            self.assertTrue(result.accepted, (layout, result.public_dict()))
+            self.assertEqual(result.digits, "13912345678")
+            self.assertEqual(result.raw.get("layout_version"), layout)
+
+    def test_crc_mismatch_is_rejected(self):
+        raw = {
+            "ok": True, "digits": "13912345678", "payload_valid": True,
+            "margin": 3.2, "margin_min": 1.2, "cc": 0.97, "crc_ok": False,
+            "logo_scale": 0.5, "mean_conf": 0.05,
+        }
+        result = AD.apply_gate(raw, carrier="inner")
+        self.assertFalse(result.accepted, result.public_dict())
+        self.assertIn("crc_mismatch", result.reason)
+        self.assertIsNone(result.digits)
 
 
 class SampleAssetTests(unittest.TestCase):

@@ -11,7 +11,7 @@
 复用 `arrow_wm` 的：码字编码（Hamming 7,4）、仿真器、配准/矫正链路。
 """
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -28,6 +28,73 @@ N_THETA: int = 1440         # 每个内孔的圆周采样数
 SCAN_HALF: float = 10.0     # 半径搜索半宽（px）
 SCAN_STEP: float = 0.25     # 半径搜索步长（px）
 
+# ---- 版式 ----------------------------------------------------------------
+# v2：140 码元 / 70 bit（37 bit 载荷 + 3 bit 固定补零），组内码元按孔顺序
+#     连续排列，一组往往整组落在同一个孔上。
+# v3：154 码元 / 77 bit（37 bit 载荷 + 7 bit CRC），11 组 (7,4)，码元按孔
+#     轮流交织，每组覆盖 3–4 个孔；CRC 取代固定补零。
+# 交织的意义：局部缺陷（A 三角失焦、纸张压痕、反光）不再让某一组 7 位全废，
+# 而是摊成"每组错 1 位"，落在 Hamming 的纠错能力内。CRC-7 同时把"自信地
+# 选错"的读数挡在门外（漏检率 1/128）。
+LAYOUT_V2 = 2
+LAYOUT_V3 = 3
+DEFAULT_LAYOUT = LAYOUT_V3
+N_CELLS_V2 = A.N_CELLS          # 140
+N_BITS_V2 = A.N_BITS            # 70
+N_CELLS_V3 = 154                # 77 bit = 11 组 × 7
+N_BITS_V3 = 77
+CRC7_POLY = 0x09                # x^7 + x^3 + 1
+
+
+# ==============================================================================
+# 0. v3 码字：37 bit 载荷 + 7 bit CRC -> 44 数据位 -> 11 组 Hamming(7,4)
+# ==============================================================================
+def crc7(bits: Sequence[int]) -> List[int]:
+    """CRC-7（多项式 x^7 + x^3 + 1），返回 7 个校验位（高位在前）。"""
+    reg = 0
+    mask = (1 << 7) - 1
+    for b in bits:
+        reg = ((reg << 1) | (int(b) & 1)) & mask
+        if reg & (1 << 6):
+            reg ^= CRC7_POLY
+    return [(reg >> (6 - i)) & 1 for i in range(7)]
+
+
+def payload_bits_v3(digits: str) -> List[int]:
+    """11 位号码 -> 44 个数据位（37 载荷 + 7 CRC）。"""
+    p37 = A.payload_to_bits(digits)
+    return p37 + crc7(p37)
+
+
+def encode_payload_v3(digits: str) -> List[int]:
+    """11 位号码 -> 77 bit 码字。"""
+    code = A.hamming74_encode(payload_bits_v3(digits))
+    assert len(code) == N_BITS_V3, len(code)
+    return code
+
+
+def decode_payload_v3_soft(soft: Sequence[float]) -> Tuple[Optional[str], bool, int]:
+    """软判决逐组最大似然 + CRC 校验。
+
+    返回 ``(号码, CRC 是否通过, 与硬判决相差的位数)``。
+    CRC 不过时号码仍是研究读数，生产门不得把它当号码放出去。
+    """
+    cb = A.hamming_codebook()
+    sgn = cb.astype(np.float64) * 2.0 - 1.0
+    soft = np.asarray(soft, np.float64).ravel()
+    if soft.size != N_BITS_V3:
+        return None, False, 0
+    hard = (soft > 0).astype(np.int8)
+    data: List[int] = []
+    n_chg = 0
+    for g in range(N_BITS_V3 // 7):
+        sl = slice(g * 7, (g + 1) * 7)
+        code = cb[int(np.argmax(sgn @ soft[sl]))]
+        data += [int(code[2]), int(code[4]), int(code[5]), int(code[6])]
+        n_chg += int(np.sum(code != hard[sl]))
+    p37, crc = data[:37], data[37:44]
+    return A.bits_to_payload(p37), crc7(p37) == crc, n_chg
+
 
 # ==============================================================================
 # 1. 载体：内孔轮廓
@@ -36,18 +103,27 @@ class InnerCarrier:
     """提取内孔、按周长分配码元、把 70 bit 写成内孔边界的径向微波。"""
 
     def __init__(self, design: Optional[A.ArrowDesign] = None,
-                 depth: float = DEPTH, verbose: bool = False):
+                 depth: float = DEPTH, verbose: bool = False,
+                 layout_version: int = DEFAULT_LAYOUT):
         self.design = design or A.ArrowDesign()
         self.depth = float(depth)
+        layout_version = int(layout_version)
+        if layout_version not in (LAYOUT_V2, LAYOUT_V3):
+            raise ValueError(f"layout_version 只能是 2 或 3，收到 {layout_version}")
+        self.layout_version = layout_version
+        self.n_cells = N_CELLS_V3 if layout_version == LAYOUT_V3 else N_CELLS_V2
+        self.n_bits = N_BITS_V3 if layout_version == LAYOUT_V3 else N_BITS_V2
         self.SS = A.SS
         self.theta = np.linspace(0.0, 2.0 * np.pi, N_THETA, endpoint=False)
         self.cos_t = np.cos(self.theta)
         self.sin_t = np.sin(self.theta)
         self.holes = self._extract_holes()
         self._alloc_cells()
+        self.pair_order = self._build_pair_order()
         if verbose:
             tot = sum(h["peri"] for h in self.holes)
-            print(f"[InnerCarrier] {len(self.holes)} 个内孔，总周长 {tot:.0f} px @1x")
+            print(f"[InnerCarrier] {len(self.holes)} 个内孔，总周长 {tot:.0f} px @1x "
+                  f"layout=v{self.layout_version} {self.n_cells} 码元")
             for i, h in enumerate(self.holes):
                 print(f"  #{i} 周长 {h['peri'] / self.SS:6.1f}px  "
                       f"{h['n_cells']:2d} 码元  "
@@ -89,7 +165,7 @@ class InnerCarrier:
 
     # ---------------- 码元分配 ----------------
     def _alloc_cells(self) -> None:
-        n_tot = A.N_CELLS
+        n_tot = self.n_cells
         per = np.array([h["peri"] for h in self.holes], np.float64)
         raw = per / per.sum() * n_tot
         alloc = np.maximum(2, (np.floor(raw / 2.0) * 2).astype(int))
@@ -116,6 +192,50 @@ class InnerCarrier:
             for k in range(h["n_cells"]):
                 self.cells.append((hi, k))
         assert len(self.cells) == n_tot, f"码元数 {len(self.cells)} != {n_tot}"
+
+    def _build_pair_order(self) -> Tuple[int, ...]:
+        """bit -> 码元对（扁平索引）的映射。
+
+        v2 为恒等映射（组内连续，容易整组落在同一个孔）。
+        v3 按孔轮流取对，使每组 7 bit 覆盖 3–4 个孔，把局部缺陷摊开。
+        """
+        if self.layout_version == LAYOUT_V2:
+            return tuple(range(N_BITS_V2))
+        per: List[List[Tuple[int, int]]] = [
+            [(hi, k) for k in range(h["n_cells"] // 2)]
+            for hi, h in enumerate(self.holes)
+        ]
+        # 按「配额均衡」排孔序：每次选 (已用+1)/配额 最小的孔。
+        # 这比简单轮转更均匀——轮转会把长孔的余量全堆到序列尾部，
+        # 末尾几组又变回只覆盖一个孔。
+        counts = [len(p) for p in per]
+        used = [0] * len(per)
+        seq: List[int] = []
+        for _ in range(sum(counts)):
+            best, best_key = -1, None
+            for hi in range(len(per)):
+                if used[hi] >= counts[hi]:
+                    continue
+                key = ((used[hi] + 1.0) / counts[hi], hi)
+                if best_key is None or key < best_key:
+                    best, best_key = hi, key
+            seq.append(best)
+            used[best] += 1
+        cursor = [0] * len(per)
+        order: List[Tuple[int, int]] = []
+        for hi in seq:
+            order.append(per[hi][cursor[hi]])
+            cursor[hi] += 1
+        index: Dict[Tuple[int, int], int] = {}
+        off = 0
+        for hi, h in enumerate(self.holes):
+            for k in range(h["n_cells"] // 2):
+                index[(hi, k)] = off + k
+            off += h["n_cells"] // 2
+        perm = tuple(index[p] for p in order)
+        if sorted(perm) != list(range(self.n_bits)):
+            raise RuntimeError("PAIR_ORDER 不是 77 长置换")
+        return perm
 
     # ---------------- 每个码元的平滑窗 ----------------
     def _window(self, hi: int, k: int) -> np.ndarray:
@@ -149,9 +269,16 @@ class InnerCarrier:
 
     # ---------------- 嵌入 ----------------
     def embed(self, digits: str) -> Dict:
-        bits = A.encode_payload(digits)
+        if self.layout_version == LAYOUT_V3:
+            bits = encode_payload_v3(digits)
+            arranged = [0] * self.n_bits
+            for b, pi in enumerate(self.pair_order):
+                arranged[pi] = bits[b]
+        else:
+            bits = A.encode_payload(digits)
+            arranged = bits
         mask4 = self.design.mask4.copy()
-        fields = self._delta(bits)
+        fields = self._delta(arranged)
         for hi, h in enumerate(self.holes):
             # 先把原孔整块填回墨色，再按调制后的多边形重新挖空
             cv2.fillPoly(mask4, [h["poly_orig"]], 255)
@@ -161,7 +288,8 @@ class InnerCarrier:
                             h["c"][1] + rr * self.sin_t], axis=1)
             cv2.fillPoly(mask4, [np.round(pts).astype(np.int32)], 0)
         plate = self.design.render(mask4)
-        return {"digits": digits, "bits": bits, "plate": plate, "mask4": mask4}
+        return {"digits": digits, "bits": bits, "plate": plate, "mask4": mask4,
+                "layout_version": self.layout_version}
 
 
 # ==============================================================================
@@ -271,31 +399,72 @@ class InnerDecoder:
         """单幅灰度图：矫正 → 内孔半径测量 → 软判决。"""
         r = self._reg.rectify(gray)
         if not r.get("ok"):
-            return {"ok": False, "reason": r.get("reason", "rectify_failed"),
-                    "digits": None, "bits": None, "mean_conf": 0.0,
-                    "margin": 0.0, "cc": 0.0}
+            return self._rectify_failure(r)
+        return self.decode_rectified(r, return_debug)
+
+    @staticmethod
+    def _rectify_failure(r: Dict) -> Dict:
+        return {"ok": False, "reason": r.get("reason", "rectify_failed"),
+                "digits": None, "bits": None, "mean_conf": 0.0,
+                "margin": 0.0, "cc": 0.0,
+                "layout_version": None, "crc_ok": None}
+
+    def decode_rectified(self, r: Dict, return_debug: bool = False) -> Dict:
+        """在已矫正的画面上测量与判决。
+
+        自动版式解码时 v2/v3 共用同一次 rectify：配准只取决于设计稿，
+        与码元版式无关。把这一步抽出来，旧印版不必再付一次配准。
+        """
         feat = self.measure(r["warped"])
-        bits: List[int] = []
-        conf: List[float] = []
-        for i in range(A.N_BITS):
-            d = float(feat[2 * i] - feat[2 * i + 1])
-            bits.append(1 if d > 0 else 0)
-            conf.append(d)
-        conf_a = np.array(conf, np.float32)
-        # 软判决最大似然：硬判决在一组内出现 2 位错时会误纠，软判决能救回
-        digits, n_chg = A.decode_payload_soft(conf_a)
-        hard, corrected, _ = A.decode_payload(bits)
         ecc = dict(r.get("ecc", {}))
         ecc.setdefault("cc", 0.0)
-        out = {"ok": True, "digits": digits, "digits_hard": hard,
-               "payload_valid": digits is not None,
-               "bits": bits, "feat": feat, "conf": conf_a,
-               "mean_conf": float(np.mean(np.abs(conf_a))) * 0.5,
-               "corrected": n_chg, "n_corrected": n_chg,
-               "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
-               "logo_scale": float(r.get("logo_scale", 1.0)),
-               "warped": r["warped"] if return_debug else None}
-        out.update(A.readout_qc(conf_a, bits, soft=True))
+        if self.carrier.layout_version == LAYOUT_V3:
+            # 码元对 -> 逻辑 bit 顺序（交织的逆映射）
+            dif = np.array([feat[2 * i] - feat[2 * i + 1]
+                            for i in range(N_BITS_V3)], np.float64)
+            conf_a = np.array([dif[pi] for pi in self.carrier.pair_order],
+                              np.float32)
+            bits = [1 if c > 0 else 0 for c in conf_a]
+            digits, crc_ok, n_chg = decode_payload_v3_soft(conf_a)
+            hard40, _, _ = A.hamming74_decode(bits)
+            digits_hard = A.bits_to_payload(hard40[:37])
+            ms = A.group_codeword_margins(conf_a)
+            margin = float(ms.mean()) if ms.size else 0.0
+            out = {"ok": True, "digits": digits, "digits_hard": digits_hard,
+                   "payload_valid": digits is not None,
+                   "bits": bits, "feat": feat, "conf": conf_a,
+                   "mean_conf": float(np.mean(np.abs(conf_a))) * 0.5,
+                   "corrected": n_chg, "n_corrected": n_chg,
+                   "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
+                   "logo_scale": float(r.get("logo_scale", 1.0)),
+                   "warped": r["warped"] if return_debug else None,
+                   "layout_version": LAYOUT_V3,
+                   "crc_ok": bool(crc_ok),
+                   "pad_bits": None,
+                   "margin": margin, "margin_mean": margin,
+                   "margin_min": float(ms.min()) if ms.size else 0.0,
+                   "group_margins": [float(x) for x in ms]}
+        else:
+            bits = []
+            conf = []
+            for i in range(N_BITS_V2):
+                d = float(feat[2 * i] - feat[2 * i + 1])
+                bits.append(1 if d > 0 else 0)
+                conf.append(d)
+            conf_a = np.array(conf, np.float32)
+            # 软判决最大似然：硬判决在一组内出现 2 位错时会误纠，软判决能救回
+            digits, n_chg = A.decode_payload_soft(conf_a)
+            hard, corrected, _ = A.decode_payload(bits)
+            out = {"ok": True, "digits": digits, "digits_hard": hard,
+                   "payload_valid": digits is not None,
+                   "bits": bits, "feat": feat, "conf": conf_a,
+                   "mean_conf": float(np.mean(np.abs(conf_a))) * 0.5,
+                   "corrected": n_chg, "n_corrected": n_chg,
+                   "ecc": ecc, "cc": float(ecc.get("cc", 0.0)),
+                   "logo_scale": float(r.get("logo_scale", 1.0)),
+                   "warped": r["warped"] if return_debug else None,
+                   "layout_version": LAYOUT_V2, "crc_ok": None}
+            out.update(A.readout_qc(conf_a, bits, soft=True))
         if return_debug:
             out["H"] = r.get("H")
         return out
@@ -376,7 +545,8 @@ def run_bench(carrier: InnerCarrier, n: int = 20, seed: int = 6000,
     sim = A.CeramicCamSimulator()
     import arrow_decode as AD
     print("=" * 88)
-    print(f"  内孔载体压测（生产门）  depth={carrier.depth:g}px  每组 {n} 样本")
+    print(f"  内孔载体压测（生产门）  layout=v{carrier.layout_version}  "
+          f"{carrier.n_cells} 码元  depth={carrier.depth:g}px  每组 {n} 样本")
     print("=" * 88)
     print(f"| {'档位':<12} | {'研究正确':>8} | {'接受且对':>8} | {'接受且错':>8} | "
           f"{'BER':>8} | {'耗时':>7} |")
@@ -395,7 +565,7 @@ def run_bench(carrier: InnerCarrier, n: int = 20, seed: int = 6000,
             t0 = __import__("time").time()
             r = dec.decode(cam["image"])
             ts.append(__import__("time").time() - t0)
-            b = np.array(r["bits"]) if r["ok"] else np.zeros(A.N_BITS, int)
+            b = np.array(r["bits"]) if r["ok"] else np.zeros(carrier.n_bits, int)
             bers.append(float(np.mean(b != tb)) * 100.0)
             research_ok += int(r.get("digits") == dg)
             gated = AD.apply_gate(r, carrier="inner", cc_threshold=cc_thr)
@@ -440,9 +610,14 @@ def main(argv=None) -> int:
     ap.add_argument("--export", metavar="DIR", default=None, help="导出送印图到目录")
     ap.add_argument("--decode", nargs="+", metavar="IMG", default=None,
                     help="解码实拍照片")
+    ap.add_argument("--layout", choices=("2", "3", "auto"), default="auto",
+                    help="内孔版式：3=交织+CRC-7（新印版），2=旧印版，"
+                         "auto=解码时自动（压测/导出按 3）")
     args = ap.parse_args(argv)
 
-    carrier = InnerCarrier(depth=args.depth, verbose=True)
+    make_layout = LAYOUT_V3 if args.layout == "auto" else int(args.layout)
+    carrier = InnerCarrier(depth=args.depth, verbose=True,
+                           layout_version=make_layout)
     if args.bench:
         run_bench(carrier, n=args.n, seed=args.seed)
     if args.export:
@@ -452,8 +627,10 @@ def main(argv=None) -> int:
         import arrow_decode as AD
         # 与边缘版同一套生产门：裕度均值、单组最小裕度、补零、cc。
         # 压测 run_bench 对 InnerDecoder 的结果再过这道门，并统计接受且错号。
-        session = AD.Decoder(carrier="inner", design=carrier.design,
-                             depth=args.depth, verbose=False)
+        session = AD.Decoder(
+            carrier="inner", design=carrier.design, depth=args.depth,
+            verbose=False,
+            layout_version=None if args.layout == "auto" else int(args.layout))
         print("=" * 78)
         print("  实拍照片解码（内孔载体，生产门限）")
         print("=" * 78)

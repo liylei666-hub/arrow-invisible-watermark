@@ -5,13 +5,17 @@ string once sync succeeds. This module is the integrator-facing wrapper:
 
 * default carrier is the inner-hole watermark (``carrier="inner"``)
 * ``carrier="edge"`` selects the edge watermark for legacy plates; its algorithm is unchanged
+* inner layout defaults to ``auto``: decode v3 (interleaved, CRC-7) first and
+  stop when the CRC passes; otherwise decode v2 (legacy plates, group-0 pad).
+  Both layouts share one registration pass. ``layout_version=2`` or ``3``
+  pins one layout.
 * a hard gate sets ``accepted=False`` and ``digits=None`` unless the readout
   clears the mean codeword-margin threshold, the per-group minimum margin,
-  the group-0 pad (``000``), and, when ECC refinement is on, the registration
-  ``cc`` gate. ``use_ecc_refine=False`` (``--no-ecc``) skips only the cc
-  gate: that path does not produce a registration score (``cc`` stays 0).
-  The margin gates and the other accept rules still apply. Default remains
-  ECC on.
+  the integrity check (v3 CRC-7, or the v2 group-0 pad ``000``), and, when
+  ECC refinement is on, the registration ``cc`` gate.
+  ``use_ecc_refine=False`` (``--no-ecc``) skips only the cc gate: that path
+  does not produce a registration score (``cc`` stays 0). The margin gates
+  and the other accept rules still apply. Default remains ECC on.
 
 ``margin`` / ``margin_mean`` is the average of the ten group gaps. One
 wrong or tied group is hidden by that average, so ``margin_min`` is a
@@ -38,6 +42,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple, Union
 
+import cv2
 import numpy as np
 
 # Production default. Edge stays selectable for legacy plates and is not tuned here.
@@ -185,6 +190,7 @@ REASON_TEXT = {
     "low_margin": "码字裕度不足",
     "low_group_margin": "单组裕度不足",
     "pad_mismatch": "补零不符",
+    "crc_mismatch": "校验码不符",
     "low_cc": "配准 cc 不足",
     "low_logo_scale": "画面中 Logo 过小",
     "invalid_payload": "码字越界",
@@ -466,9 +472,15 @@ def apply_gate(raw: Dict, *, carrier: str = DEFAULT_CARRIER,
             reasons.append("low_margin")
         if margin_min < min_group_margin:
             reasons.append("low_group_margin")
-        pad = _resolve_pad(raw)
-        if pad is not None and pad != PAD_BITS:
-            reasons.append("pad_mismatch")
+        # v3 用 CRC-7 取代固定补零：crc_ok 存在时以它为准，不再看补零。
+        crc_ok = raw.get("crc_ok")
+        if crc_ok is not None:
+            if not bool(crc_ok):
+                reasons.append("crc_mismatch")
+        else:
+            pad = _resolve_pad(raw)
+            if pad is not None and pad != PAD_BITS:
+                reasons.append("pad_mismatch")
 
     accepted = not reasons
     return DecodeResult(
@@ -518,6 +530,106 @@ def _unreadable(carrier: str, margin_threshold: float,
     return apply_gate(raw, carrier=carrier, margin_threshold=margin_threshold,
                       min_group_margin=min_group_margin,
                       cc_threshold=cc_threshold)
+
+
+def _normalize_inner_layout(value) -> Union[int, str]:
+    """内孔版式：None / "auto" 自动，或显式 2 / 3。
+
+    自动模式先解 v3（CRC-7），通过即定案；不过再解 v2，兼容已印出的旧版。
+    """
+    if value is None:
+        return "auto"
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "auto"):
+            return "auto"
+        value = text
+    layout = int(value)
+    if layout not in (2, 3):
+        raise ValueError(f"inner layout 只能是 2、3 或 auto，收到 {value!r}")
+    return layout
+
+
+class _InnerAuto:
+    """内孔自动版式：v3 优先，v2 兜底。"""
+
+    def __init__(self, design, depth: float, verbose: bool,
+                 use_ecc_refine: bool):
+        import arrow_inner as I
+        self._v3 = I.InnerDecoder(
+            I.InnerCarrier(design, depth=depth, verbose=verbose,
+                           layout_version=I.LAYOUT_V3),
+            use_ecc_refine=use_ecc_refine)
+        self._v2 = I.InnerDecoder(
+            I.InnerCarrier(design, depth=depth, verbose=verbose,
+                           layout_version=I.LAYOUT_V2),
+            use_ecc_refine=use_ecc_refine)
+
+    def _pair(self, gray: np.ndarray, return_debug: bool):
+        """同一画面、同一次配准，分别按 v3 / v2 测量。
+
+        v3 的 CRC 通过就不必再解 v2；否则才付第二遍测量的代价
+        （配准仍然只做一次）。
+        """
+        r = self._v3._reg.rectify(gray)
+        if not r.get("ok"):
+            return self._v3._rectify_failure(r), None
+        a = self._v3.decode_rectified(r, return_debug)
+        if a.get("crc_ok"):
+            return a, None
+        return a, self._v2.decode_rectified(r, return_debug)
+
+    def decode(self, image: np.ndarray, return_debug: bool = False):
+        if image.ndim == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        plates = self._v3._reg._plate_candidates(gray, k=3)
+        plate_first = False
+        if plates:
+            frac = plates[0].size / float(max(gray.size, 1))
+            plate_first = frac < 0.45 and max(gray.shape[:2]) >= 1600
+
+        best = None
+        best_key = None
+
+        def consider(a, b, path: str, isolated: bool = False) -> None:
+            nonlocal best, best_key
+            for res in (a, b):
+                if not res or not res.get("ok"):
+                    continue
+                valid = bool(res.get("crc_ok")) or res.get("pad_bits") == [0, 0, 0]
+                key = (1 if valid else 0,
+                       1 if float(res.get("cc", 0.0)) >= 0.85 else 0,
+                       float(res.get("mean_conf", 0.0)))
+                if best is None or key > best_key:
+                    best = dict(res)
+                    best_key = key
+                    best["path"] = path
+                    if isolated:
+                        best["isolated"] = True
+
+        def good_enough() -> bool:
+            return best is not None and best_key[0] == 1 and best_key[1] == 1
+
+        if not plate_first:
+            consider(*self._pair(gray, return_debug), "full")
+            if good_enough():
+                return best
+        for k, cand in enumerate(plates):
+            if cand.size / float(max(gray.size, 1)) >= 0.85:
+                continue
+            consider(*self._pair(cand, return_debug), f"plate#{k}", isolated=True)
+            if good_enough():
+                return best
+        if plate_first:
+            consider(*self._pair(gray, return_debug), "full")
+        if best is not None:
+            return best
+        return {"ok": False, "reason": "decode_failed", "digits": None,
+                "bits": None, "mean_conf": 0.0, "margin": 0.0, "cc": 0.0,
+                "layout_version": None, "crc_ok": None, "path": "none"}
 
 
 class Decoder:
@@ -578,10 +690,17 @@ class Decoder:
             # Default radial depth stays at arrow_inner.DEPTH. This wrapper
             # does not retune inner robustness.
             used_depth = I.DEPTH if depth is None else float(depth)
-            self._inner = I.InnerCarrier(self.design, depth=used_depth,
-                                         verbose=verbose)
-            self._impl = I.InnerDecoder(self._inner,
-                                        use_ecc_refine=self.use_ecc_refine)
+            self.inner_layout = _normalize_inner_layout(layout_version)
+            if self.inner_layout == "auto":
+                self._inner = None
+                self._impl = _InnerAuto(self.design, used_depth, verbose,
+                                        self.use_ecc_refine)
+            else:
+                self._inner = I.InnerCarrier(
+                    self.design, depth=used_depth, verbose=verbose,
+                    layout_version=self.inner_layout)
+                self._impl = I.InnerDecoder(
+                    self._inner, use_ecc_refine=self.use_ecc_refine)
 
     def decode(self, image: ImageLike, *, return_debug: bool = False) -> DecodeResult:
         """Decode one image or file path.

@@ -2,6 +2,8 @@
 
 把仓库根目录的 `arrow_decode.Decoder` 包成一个小 HTTP 服务，给微信小程序和腾讯云 TI-ONE 在线服务用。算法不在这里改：默认载体是内孔（`inner`），旧边缘印版用显式 `edge`。
 
+内孔默认 `layout=auto`：先解 v3（交织 + CRC-7），CRC 不通过再解 v2 旧印版。客户端不需要加参数，已印出的旧版照常可解；两版共用同一次配准。
+
 契约见 [docs/miniprogram-integration.md](../../docs/miniprogram-integration.md)。TI-ONE 上怎么挂、以及不要动其他已有服务，见 [TI-ONE.md](TI-ONE.md)。微信云托管（服务名 `arrow-decode`、GitHub 构建、`callContainer`）见 [docs/wechat-cloudrun.md](../../docs/wechat-cloudrun.md)。
 
 ## 端口
