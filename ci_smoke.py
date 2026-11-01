@@ -132,8 +132,8 @@ class GateTests(unittest.TestCase):
     def test_gate_photo_inner_fields_are_accepted(self):
         # Real inner photo 17701234567: correct candidate, previously rejected
         # only by logo_scale≈0.1595 and margin_min≈0.604. Those cuts are now
-        # 0.15 and 0.55. The 0.077 tiny-logo case and the ~0.325 near-tie stay
-        # rejected by the tests above and below.
+        # 0.1 and 0.55. The 0.077 tiny-logo case and the ~0.325 near-tie stay
+        # rejected by the tests above and below. ~0.14 clears the scale gate.
         raw = {
             "ok": True, "digits": "17701234567", "payload_valid": True,
             "margin": 2.80, "margin_min": 0.604, "cc": 0.975,
@@ -146,6 +146,28 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result.candidate_digits, "17701234567")
         self.assertGreaterEqual(result.logo_scale, AD.LOGO_SCALE_MIN)
         self.assertGreaterEqual(result.margin_min, AD.MIN_GROUP_MARGIN)
+
+    def test_logo_scale_around_0_14_clears_scale_gate(self):
+        # 0.14 sat under the old 0.15 cut. The scale gate alone now accepts
+        # it. Margin, pad, and cc stay well above their cuts, so a reject
+        # here would be the scale gate.
+        raw = {
+            "ok": True, "digits": "13800138000", "payload_valid": True,
+            "margin": 4.2, "margin_min": 3.0, "cc": 0.97,
+            "mean_conf": 0.05, "logo_scale": 0.14, "pad_bits": [0, 0, 0],
+        }
+        result = AD.apply_gate(raw)
+        self.assertTrue(result.accepted, result.public_dict())
+        self.assertEqual(result.digits, "13800138000")
+        self.assertNotIn("low_logo_scale", result.reason)
+        self.assertGreaterEqual(result.logo_scale, AD.LOGO_SCALE_MIN)
+
+        below = dict(raw, logo_scale=0.099)
+        rejected = AD.apply_gate(below)
+        self.assertFalse(rejected.accepted, rejected.public_dict())
+        self.assertIsNone(rejected.digits)
+        self.assertEqual(rejected.reason, "low_logo_scale")
+        self.assertLess(rejected.logo_scale, AD.LOGO_SCALE_MIN)
 
     def test_clear_read_is_accepted(self):
         raw = {
@@ -355,7 +377,7 @@ class RoundtripTests(unittest.TestCase):
 
 
 class LogoScaleUpscaleTests(unittest.TestCase):
-    """Interpolation must not inflate logo_scale or slip past 0.15."""
+    """Interpolation must not inflate logo_scale or slip past 0.1."""
 
     @classmethod
     def setUpClass(cls):
@@ -364,7 +386,7 @@ class LogoScaleUpscaleTests(unittest.TestCase):
     def test_gates_and_low_logo_scale_copy(self):
         import arrow_inner as I
         self.assertEqual(AD.DEFAULT_CARRIER, "inner")
-        self.assertEqual(AD.LOGO_SCALE_MIN, 0.15)
+        self.assertEqual(AD.LOGO_SCALE_MIN, 0.1)
         self.assertEqual(AD.MIN_GROUP_MARGIN, 0.55)
         self.assertEqual(AD.MARGIN_THRESHOLD, 1.8)
         self.assertEqual(AD.CC_THRESHOLD, 0.85)

@@ -1659,7 +1659,7 @@ class CeramicCamSimulator:
 
 # OpenCV 整数倍 INTER_LINEAR / INTER_CUBIC 放大后，行和列会落进线性插值子空间。
 # 真照片不会。logo_scale 用单应在上传像素上的宽度，再除以这个倍数，
-# 避免「把小图插值放大」绕过 0.15。阈值卡在「干净插值」和「只是有点糊」之间：
+# 避免「把小图插值放大」绕过 0.1。阈值卡在「干净插值」和「只是有点糊」之间：
 #   真 4× 线性 < 0.006，2× 大画幅在 4× 检验上约 0.020（不能当成 4×）；
 #   真 2× 线性 < 0.006，门控原图约 0.053，再高斯糊 σ≈1.2 仍约 0.013。
 # σ≈1.6 的重糊会碰到 2× 门，那种帧波形已经没了，不会因此被接受。
@@ -1760,7 +1760,7 @@ def interpolation_upscale_factor(image: np.ndarray) -> int:
 
     4 or 2 means the whole frame is an integer linear/cubic upsample.
     Callers divide the homography's logo_scale by this so a client-side
-    interpolate-to-inflate does not move the 0.15 gate. A native photo,
+    interpolate-to-inflate does not move the 0.1 gate. A native photo,
     and a real downscale such as the 0.077 tiny logo, returns 1.
     """
     if image.ndim == 3:
@@ -2338,7 +2338,7 @@ class WatermarkDecoder:
                 break
         # 小尺寸实拍：边缘恢复后再交给宽度测量。
         # 尺度来自原图像素上的 H。整幅被 2×/4× 插值放大时除掉这个倍数，
-        # 否则 logo_scale 会跟着像素网格变大、绕过 0.15。
+        # 否则 logo_scale 会跟着像素网格变大、绕过 0.1。
         sc = self._logo_scale(best["H"])
         if upscale_factor is None:
             scale_img = source if use_source else gray

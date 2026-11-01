@@ -81,13 +81,14 @@ CC_THRESHOLD = 0.85
 # (±6 px at scale 0.077 is ±0.46 px). That documented tiny frame stays
 # rejected. Extreme sims in this repo sit around 0.7–0.9, so the cut does
 # not touch that bench. The inner photo 17701234567 is logo_scale ≈ 0.160
-# with a correct readout; 0.15 accepts it and still rejects 0.077.
+# with a correct readout; 0.1 accepts it and still rejects 0.077. A scale
+# around 0.14 clears this gate on its own.
 # A frame under the cut is rejected even when registration cc is high.
 # It does not relax the margin gates. A 2×/4× interpolation of the same
 # pixels is not a larger logo: logo_scale stays on the pre-upscale grid
 # (homography scale divided by the detected integer factor), and margin /
 # pad still have to clear.
-LOGO_SCALE_MIN = 0.15
+LOGO_SCALE_MIN = 0.1
 
 ImageLike = Union[np.ndarray, str, os.PathLike]
 
