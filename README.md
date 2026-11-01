@@ -178,6 +178,9 @@ verify_decode.py       单张解码 + 核验图 + 验真模式
 batch_decode.py        批量解码（扫目录 / CSV / 批量出图）
 ci_smoke.py            嵌入/解码冒烟 + 接受门单测（CI 入口）
 requirements.txt       运行与 CI 依赖
+Dockerfile             仓库根构建上下文（与 services/decode_api/Dockerfile 相同）
+wxcloudrun/             微信云托管把目标目录设为该文件夹时的构建上下文
+docs/wechat-cloudrun.md 微信云托管控制台清单与 callContainer 示例
 .github/workflows/ci.yml  安装依赖并跑 ci_smoke.py
 make_test_samples.py   生成 10 组随机号码实测样张 + A4 打印排版图
 compare_carrier.py     两种载体的定量对比

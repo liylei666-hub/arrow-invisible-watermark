@@ -10,9 +10,13 @@ https://ms-2w5g828w-100050884192.gw.ap-shanghai.ti.tencentcs.com/ms-2w5g828w/dec
 
 网关前缀 `/ms-2w5g828w` 后面的 `/decode` 才是应用路由。新服务换成新的 id，路径仍以 `/decode` 结尾。
 
+微信云托管上的控制台参数和 `wx.cloud.callContainer` 示例在 [wechat-cloudrun.md](wechat-cloudrun.md)。服务名 `arrow-decode`，头 `X-WX-SERVICE: arrow-decode`，路径仍是 `/decode`。
+
 ## 请求
 
-`POST /decode`，`Content-Type: multipart/form-data`。
+`POST /decode`。原来的 `multipart/form-data` 不变。另外也接受 JSON `image_base64`，以及 `application/octet-stream` / `image/jpeg` / `image/png` 的原始图片字节（`carrier` 放查询参数）。`callContainer` 默认发 JSON，组 multipart 不可靠，照片优先用原始字节。细节和 100 KiB 文本上限见 [wechat-cloudrun.md](wechat-cloudrun.md)。
+
+multipart 的约定：
 
 | 位置 | 名字 | 必填 | 说明 |
 |---|---|---|---|
@@ -22,7 +26,7 @@ https://ms-2w5g828w-100050884192.gw.ap-shanghai.ti.tencentcs.com/ms-2w5g828w/dec
 
 微信侧用 `wx.uploadFile`：`url` 为网关完整地址（含 `/ms-<id>/decode`），`name` 为 `image`，`formData` 可带 `carrier: "edge"`（不带则服务端默认边缘）。若控制台另开了 TI-ONE 服务鉴权，还要按平台要求带 `Authorization`，那是网关的头，不是 `X-Decode-Token`。
 
-图片请控制在 20 MB 以内。空文件、缺字段、`carrier` 不是 `edge`/`inner`、或正文不是 multipart，返回 400，`{"detail":"..."}`。令牌不对返回 401，`{"detail":"unauthorized"}`。过大返回 413。这些不是解码结果，小程序按网络错误处理即可。
+图片请控制在 20 MB 以内。空文件、缺字段、`carrier` 不是 `edge`/`inner`、或正文类型无法识别，返回 400，`{"detail":"..."}`。令牌不对返回 401，`{"detail":"unauthorized"}`。过大返回 413。这些不是解码结果，小程序按网络错误处理即可。
 
 ## 响应
 

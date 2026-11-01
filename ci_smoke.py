@@ -406,6 +406,128 @@ class ServiceContractTests(unittest.TestCase):
             self.svc.ensure_upload_size(self.svc.MAX_IMAGE_BYTES + 1)
         self.assertEqual(ctx.exception.status_code, 413)
 
+    def test_json_base64_uses_same_gate(self):
+        payload = base64.b64encode(_PNG_1X1).decode("ascii")
+        response = self.client.post(
+            "/decode",
+            json={"image_base64": payload, "carrier": "inner"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["accepted"])
+        self.assertEqual(body["digits"], "13800138000")
+        self.assertEqual(body["carrier"], "inner")
+        self.assertEqual(self.calls, [("inner", 1)])
+
+    def test_json_query_carrier_beats_body_and_data_url(self):
+        payload = "data:image/png;base64," + base64.b64encode(_PNG_1X1).decode("ascii")
+        response = self.client.post(
+            "/decode?carrier=edge",
+            json={"image_base64": payload, "carrier": "inner"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["carrier"], "edge")
+        self.assertEqual(self.calls[0][0], "edge")
+
+    def test_json_errors_do_not_decode(self):
+        missing = self.client.post("/decode", json={"carrier": "edge"})
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json()["detail"], "missing image_base64")
+        bad = self.client.post("/decode", json={"image_base64": "!!!!"})
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(bad.json()["detail"], "invalid image_base64")
+        both = self.client.post("/decode", json={"image_base64": "aaaa", "carrier": "both"})
+        self.assertEqual(both.status_code, 400)
+        broken = self.client.post(
+            "/decode",
+            content=b"{",
+            headers={"content-type": "application/json"},
+        )
+        self.assertEqual(broken.status_code, 400)
+        from fastapi import HTTPException
+        previous = self.svc._BASE64_CHAR_CAP
+        self.svc._BASE64_CHAR_CAP = 8
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                self.svc.decode_base64_image("ABCDEFGHIJKL")
+        finally:
+            self.svc._BASE64_CHAR_CAP = previous
+        self.assertEqual(ctx.exception.status_code, 413)
+        self.assertEqual(self.calls, [])
+
+    def test_raw_image_body_and_token(self):
+        response = self.client.post(
+            "/decode?carrier=inner",
+            content=_PNG_1X1,
+            headers={"content-type": "image/png"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.calls, [("inner", 1)])
+        empty = self.client.post(
+            "/decode",
+            content=b"",
+            headers={"content-type": "application/octet-stream"},
+        )
+        self.assertEqual(empty.status_code, 400)
+        os.environ["DECODE_TOKEN"] = "devsecret"
+        denied = self.client.post(
+            "/decode",
+            json={"image_base64": base64.b64encode(_PNG_1X1).decode("ascii")},
+            headers={"X-Decode-Token": "nope"},
+        )
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(self.client.get("/health").status_code, 200)
+
+
+class CloudRunPackagingTests(unittest.TestCase):
+    """Repo-root and wxcloudrun/ build contexts ship the same image inputs."""
+
+    _VENDOR = (
+        "arrow_decode.py",
+        "arrow_wm.py",
+        "arrow_inner.py",
+        "ARROW_clean_pro.png",
+        "services/__init__.py",
+        "services/decode_api/__init__.py",
+        "services/decode_api/app.py",
+        "services/decode_api/requirements.txt",
+    )
+
+    def _root(self):
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def test_dockerfiles_are_identical_and_listen_on_8501(self):
+        root = self._root()
+        paths = [
+            os.path.join(root, "Dockerfile"),
+            os.path.join(root, "services", "decode_api", "Dockerfile"),
+            os.path.join(root, "wxcloudrun", "Dockerfile"),
+        ]
+        bodies = []
+        for path in paths:
+            with open(path, "rb") as handle:
+                bodies.append(handle.read())
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertEqual(bodies[0], bodies[2])
+        text = bodies[0].decode("utf-8")
+        self.assertIn("EXPOSE 8501", text)
+        self.assertIn("--host 0.0.0.0", text)
+        self.assertIn("--port ${PORT:-8501}", text)
+        self.assertIn("COPY services/decode_api/requirements.txt", text)
+        self.assertIn("COPY arrow_decode.py arrow_wm.py arrow_inner.py ARROW_clean_pro.png", text)
+
+    def test_wxcloudrun_vendor_matches_repo(self):
+        root = self._root()
+        for rel in self._VENDOR:
+            src = os.path.join(root, rel)
+            dst = os.path.join(root, "wxcloudrun", rel)
+            with open(src, "rb") as src_file, open(dst, "rb") as dst_file:
+                same = src_file.read() == dst_file.read()
+            self.assertTrue(
+                same,
+                "wxcloudrun/%s does not match %s; copy the repo file over it" % (rel, rel),
+            )
+
 
 _PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="

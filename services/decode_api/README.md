@@ -2,7 +2,7 @@
 
 把仓库根目录的 `arrow_decode.Decoder` 包成一个小 HTTP 服务，给微信小程序和腾讯云 TI-ONE 在线服务用。算法和接受门都不在这里改：默认载体仍是边缘（`edge`），`inner` 只是显式选项。
 
-契约见 [docs/miniprogram-integration.md](../../docs/miniprogram-integration.md)。TI-ONE 上怎么挂、以及**不要动其他已有服务**，见 [TI-ONE.md](TI-ONE.md)。
+契约见 [docs/miniprogram-integration.md](../../docs/miniprogram-integration.md)。TI-ONE 上怎么挂、以及不要动其他已有服务，见 [TI-ONE.md](TI-ONE.md)。微信云托管（服务名 `arrow-decode`、GitHub 构建、`callContainer`）见 [docs/wechat-cloudrun.md](../../docs/wechat-cloudrun.md)。
 
 ## 端口
 
@@ -53,7 +53,14 @@ curl -s -F "image=@photo.jpg" -F "carrier=edge" \
   http://127.0.0.1:8501/decode
 ```
 
-成功时 JSON 里 `accepted` 为 `true`，`digits` 是 11 位号码，`reason_text` 为「接受」。拒绝时 `accepted` 为 `false`，`digits` 为 `null`，用 `reason` / `reason_text` 提示用户。`candidate_digits` 只是诊断读数，**不能当号码显示**。
+成功时 JSON 里 `accepted` 为 `true`，`digits` 是 11 位号码，`reason_text` 为「接受」。拒绝时 `accepted` 为 `false`，`digits` 为 `null`，用 `reason` / `reason_text` 提示用户。`candidate_digits` 只是诊断读数，不能当号码显示。
+
+`POST /decode` 还接受另外两种正文，返回和鉴权与 multipart 相同：
+
+- `application/json`：`{"image_base64":"<base64>","carrier":"edge"}`。查询参数 `carrier` 优先于 JSON 字段。
+- `application/octet-stream` 或 `image/jpeg` / `image/png`：正文就是图片字节，`carrier` 只看查询参数。
+
+微信 `wx.cloud.callContainer` 用这两种，因为组 multipart 不稳定。控制台步骤和示例在 [docs/wechat-cloudrun.md](../../docs/wechat-cloudrun.md)。
 
 无码对照应被拒绝（`digits` 为 `null`）：
 
@@ -81,13 +88,19 @@ TI-ONE 控制台自己的「服务鉴权」（`Authorization`）是另一层，�
 
 ## 镜像
 
-在仓库根目录构建（上下文必须是仓库根，母版 PNG 和 `arrow_wm.py` 要在同一层）：
+两份构建上下文都可以，Dockerfile 内容相同：
 
 ```bash
+# 上下文 = 仓库根（微信云托管目标目录留空）
+docker build -t arrow-decode-api .
 docker build -f services/decode_api/Dockerfile -t arrow-decode-api .
+
+# 上下文 = wxcloudrun/（目标目录填 wxcloudrun，Dockerfile 在该目录根上）
+docker build -t arrow-decode-api wxcloudrun
+
 docker run --rm -p 8501:8501 arrow-decode-api
 ```
 
-镜像里只装 `services/decode_api/requirements.txt`（numpy、opencv-python-headless、fastapi、uvicorn、python-multipart），不装 matplotlib。启动命令是单 worker 的 uvicorn，监听 `0.0.0.0:${PORT:-8501}`。
+`wxcloudrun/` 里的源码是仓库根那几份的副本（母版 PNG、`arrow_wm.py`、HTTP 服务）。CI 要求两边一致。镜像里只装 `services/decode_api/requirements.txt`（numpy、opencv-python-headless、fastapi、uvicorn、python-multipart），不装 matplotlib。启动命令是单 worker 的 uvicorn，监听 `0.0.0.0:${PORT:-8501}`。
 
 同一进程内解码是串行的。不要把 `--workers` 加大来赌吞吐：每个进程都会再加载一套模板。

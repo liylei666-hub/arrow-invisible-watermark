@@ -1,16 +1,26 @@
-# ARROW decode HTTP service for a Tencent Cloud TI-ONE online service (模型服务).
+# ARROW decode HTTP service (TI-ONE and WeChat 云托管).
 #
-# Listen port is 8501: that is the TI-ONE REST default, and the platform
-# readiness probe also defaults to 8501. In the console, set 端口 to 8501
-# (or set PORT to another allowed port and put that same number in 端口).
-# Do not use 8500 (gRPC default) or the reserved ports 8502-8510, 6006, 9092.
+# The process listens on 0.0.0.0:${PORT:-8501}. In the WeChat console set
+# 监听端口 to 8501 (the form default is 80). On TI-ONE set 端口 to 8501.
+# Do not use 8500 (gRPC) or the reserved ports 8502-8510, 6006, 9092.
 #
 # The image is self-contained (code + ARROW_clean_pro.png). Do not mount a
 # model directory over /opt/arrow, and do not rely on /data/model — TI-ONE
 # overwrites /data/model when a CFS/COS model source is selected.
 #
-# Build from the repository root:
+# This file is byte-identical in three places:
+#   Dockerfile
+#   services/decode_api/Dockerfile
+#   wxcloudrun/Dockerfile
+# wxcloudrun/ holds a copy of the sources this file COPYs, so either build
+# context works. CI checks the copies match.
+#
+# Context = repository root (WeChat 目标目录 left empty, Dockerfile name Dockerfile):
+#   docker build -t arrow-decode-api .
 #   docker build -f services/decode_api/Dockerfile -t arrow-decode-api .
+# Context = wxcloudrun/ (WeChat 目标目录 = wxcloudrun, Dockerfile name Dockerfile):
+#   docker build -t arrow-decode-api wxcloudrun
+#
 # Run:
 #   docker run --rm -p 8501:8501 arrow-decode-api
 
