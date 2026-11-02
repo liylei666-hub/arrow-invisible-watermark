@@ -100,6 +100,12 @@ CC_THRESHOLD = 0.85
 # same pixels is a different image that still has to clear margin / pad.
 LOGO_SCALE_MIN = 0.10
 
+# 首解被拒时的兜底：换尺度再解一次。只对 v3（CRC 可裁决）启用；
+# 成功路径不付代价，只有拒绝路径最多多两次解码。实测 extreme 档
+# 24 个样本救回 2 个，且没有新增误收。
+RETRY_SCALES = (1.5, 0.7)
+RETRY_MAX_SIDE = 6000
+
 ImageLike = Union[np.ndarray, str, os.PathLike]
 
 # ---- 共享构造缓存 ----------------------------------------------------------
@@ -577,6 +583,10 @@ class _InnerAuto:
         a = self._v3.decode_rectified(r, return_debug)
         if a.get("crc_ok"):
             return a, None
+        # 两版共用同一次配准，cc 是同一个值：cc 低于生产门时 v2 也过不了，
+        # 直接跳过第二遍测量（垃圾图/无码图能省掉一半时间）。
+        if float(a.get("cc", 0.0)) < CC_THRESHOLD:
+            return a, None
         return a, self._v2.decode_rectified(r, return_debug)
 
     def decode(self, image: np.ndarray, return_debug: bool = False):
@@ -717,11 +727,40 @@ class Decoder:
         raw = self._impl.decode(loaded, return_debug=return_debug)
         if not isinstance(raw, dict):
             raw = {"ok": False, "reason": "decode_failed", "digits": None}
-        return apply_gate(
-            raw, carrier=self.carrier,
-            margin_threshold=self.margin_threshold,
-            min_group_margin=self.min_group_margin,
-            cc_threshold=self.cc_threshold)
+
+        def _gate(r: Dict) -> DecodeResult:
+            return apply_gate(
+                r, carrier=self.carrier,
+                margin_threshold=self.margin_threshold,
+                min_group_margin=self.min_group_margin,
+                cc_threshold=self.cc_threshold)
+
+        result = _gate(raw)
+        # 多尺度兜底：仅内孔 v3 且首解被拒时。CRC 负责裁决，不会因为
+        # 放大而把旧的 v2 读数放出去；return_debug 时跳过，避免调试图错位。
+        # 只救"像水印但差一点"的拒绝：同步成功、cc 不太差、裕度接近门限。
+        # 垃圾图/无码图的裕度远低于门槛，重试只会白花 1–2 秒。
+        plausibly_near = (
+            bool(raw.get("ok"))
+            and float(raw.get("cc", 0.0)) >= 0.60
+            and float(raw.get("margin", 0.0)) >= 1.2
+            and float(raw.get("margin_min", 0.0)) >= 0.20)
+        if (not result.accepted and not return_debug and plausibly_near
+                and self.carrier == "inner"
+                and getattr(self, "inner_layout", None) in (3, "auto")):
+            for scale in RETRY_SCALES:
+                if max(loaded.shape[:2]) * scale > RETRY_MAX_SIDE:
+                    continue
+                interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+                scaled = cv2.resize(loaded, None, fx=scale, fy=scale,
+                                    interpolation=interp)
+                raw2 = self._impl.decode(scaled, return_debug=False)
+                if not isinstance(raw2, dict):
+                    continue
+                res2 = _gate(raw2)
+                if res2.accepted:
+                    return res2
+        return result
 
 
 def decode(image: ImageLike, carrier: str = DEFAULT_CARRIER, *,
